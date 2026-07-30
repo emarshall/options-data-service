@@ -1,0 +1,111 @@
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-options_data}
+      POSTGRES_USER: ${POSTGRES_USER:-options_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    ports:
+      - "${HOST_DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-options_user} -d ${POSTGRES_DB:-options_data}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot: applies Alembic migrations, then exits. ingestion/api wait for
+  # this to complete successfully before starting (see depends_on below) so
+  # they never race against a not-yet-migrated database.
+  migrate:
+    build: .
+    command: alembic upgrade head
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: "no"
+
+  ingestion:
+    build: .
+    command: python -m service.ingestion.main
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: uvicorn service.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # On-demand: backfills ~6 weeks of historical 1m candles for all tracked
+  # contracts + underlyings (Task 5). Idempotent — safe to run repeatedly,
+  # e.g. after downtime, without duplicating data. NOT started by default
+  # `docker compose up` (see `profiles` below) since it's a one-off/
+  # periodic job, not a continuously-running service — run it explicitly:
+  #   docker compose run --rm backfill
+  backfill:
+    build: .
+    command: python -m service.ingestion.backfill
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    profiles: ["backfill"]
+
+  # On-demand: computes Greeks (via Black-Scholes) for option_bars_1m rows
+  # that don't have any yet — backfilled rows (Task 5, which never writes
+  # Greeks) and any Task 4 live-ingestion gaps. Idempotent in the sense
+  # that already-computed/live rows are never touched (only
+  # greeks_source IS NULL rows are considered). NOT started by default
+  # `docker compose up` (see `profiles`) — run it explicitly, typically
+  # after a `backfill` run:
+  #   docker compose run --rm greeks-backfill
+  greeks-backfill:
+    build: .
+    command: python -m service.greeks.backfill_job
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    profiles: ["greeks-backfill"]
+
+volumes:
+  timescale_data:

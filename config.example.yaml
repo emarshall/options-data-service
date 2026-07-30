@@ -1,0 +1,26 @@
+# Non-secret, human-edited config: which tickers to track and what delta
+# range of contracts to subscribe to for each. Copy to config.yaml and
+# adjust. See service/config/settings.py for the full field list/defaults.
+#
+# NOTE: this file isn't wired into the ingestion pipeline's actual contract
+# selection yet — that logic is Task 3. Right now it's only read for
+# logging/validation by the Task 1 placeholder services.
+
+tickers:
+  - ticker: SPY
+    call_delta_min: 0.15
+    call_delta_max: 0.85
+    put_delta_min: -0.85
+    put_delta_max: -0.15
+    exclude_am_settled: true
+    capture_underlying_bars: true
+    max_days_to_expiration: 45
+
+  - ticker: QQQ
+    call_delta_min: 0.15
+    call_delta_max: 0.85
+    put_delta_min: -0.85
+    put_delta_max: -0.15
+    exclude_am_settled: true
+    capture_underlying_bars: true
+    max_days_to_expiration: 45
