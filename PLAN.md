@@ -593,6 +593,33 @@ behavior, which stays a real-Postgres-only concern (validated separately, see ab
 pure unit tests (`tests/test_views.py`) for the table-selection functions themselves. 122 tests total in
 the repo now (120 run, 2 opt-in Postgres tests skipped as designed).
 
+**Extension (2026-07-31): `GET /metadata`** — a fourth, unfiltered read endpoint giving a client (mainly
+the future backtest script) a quick summary of what data actually exists before it starts querying bars:
+which tickers have any `option_bars_1m` rows at all, each ticker's observed time range (`MIN`/`MAX` of
+`time`), and a total row count across the whole table. Deliberately raw `text()` SQL rather than the
+Core/ORM query-building the other three endpoints use — it's three simple aggregate queries against a
+single table, not filterable, so there's no query-building logic worth abstracting. No pagination
+(nothing here scales with row count the way bars/contracts do), and no `agg`/ticker/date-range params —
+it's a fixed summary, not a filtered list.
+
+Found and fixed two real bugs while wiring this up, both in `service/api/routes.py`:
+- `from service.db.session import _engine, get_session` shadowed the earlier `from service.api.deps
+  import get_session` import — every route in the file was using `session.py`'s
+  `@asynccontextmanager`-wrapped `get_session` (meant for direct `async with` use elsewhere, e.g.
+  `check_connection()`) instead of `deps.py`'s plain-generator version that FastAPI's `Depends()`
+  actually expects. Symptom: `TypeError: '_AsyncGeneratorContextManager' object is not an async
+  iterator` on every request. Fix: only import `_engine` from `service.db.session`; keep `get_session`
+  sourced from `service.api.deps`.
+- In the new `metadata()` handler itself, `total_rows = (await result_row_count.fetchone())[0]` —
+  `AsyncSession.execute()` already returns a resolved (sync) `Result`; `.fetchone()`/`.fetchall()` on it
+  are ordinary sync calls, not coroutines. Fix: drop the stray `await`.
+
+Both bugs were caught by actually running the endpoint against the live stack, not by the test suite —
+worth adding a `tests/test_api.py` case for `/metadata` specifically so a future regression on either
+front fails a test instead of only showing up at request time.
+
+**Deliverables:** `service/api/routes.py` (updated).
+
 ---
 
 ### Task 9 — Config Finalization, Contract Roll Scheduling, AM-Settlement Handling

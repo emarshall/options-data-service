@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from service.api.auth import require_api_key
@@ -26,6 +26,7 @@ from service.api.schemas import (
     UnderlyingBarsResponse,
 )
 from service.db.models import Contract, OptionRight
+from service.db.session import _engine
 from service.db.views import AGG_PERIODS, get_option_bars_table, get_underlying_bars_table
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
@@ -166,3 +167,45 @@ async def get_contracts(
         offset=offset,
         returned=len(rows),
     )
+
+@router.get("/metadata")
+async def metadata(
+    session: AsyncSession = Depends(get_session)
+):
+    """Returns summary metadata about tickers and data ranges."""
+
+    query_tickers = """
+        SELECT DISTINCT underlying_ticker FROM option_bars_1m;
+    """
+
+    query_date_ranges = """
+        SELECT 
+            t.underlying_ticker,
+            MIN(t.time) AS start_date,
+            MAX(t.time) AS end_date
+        FROM option_bars_1m t
+        GROUP BY t.underlying_ticker;
+    """
+
+    query_row_count = """
+        SELECT COUNT(*) AS total_rows 
+        FROM option_bars_1m;
+    """
+
+    result_tickers = await session.execute(text(query_tickers))
+    tickers = [row.underlying_ticker for row in result_tickers.fetchall()]
+
+    result_date_ranges = await session.execute(text(query_date_ranges))
+    date_ranges = {
+        row.underlying_ticker: {"start": str(row.start_date), "end": str(row.end_date)}
+        for row in result_date_ranges.fetchall()
+    }
+
+    result_row_count = await session.execute(text(query_row_count))
+    total_rows = result_row_count.fetchone()[0]
+
+    return {
+        "tickers": tickers,
+        "date_ranges_by_ticker": date_ranges,
+        "total_db_rows_estimate": total_rows
+    }

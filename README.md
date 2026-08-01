@@ -90,8 +90,14 @@ Working right now:
   ticker, time range, `agg` — 1m/5m/15m/30m/1h/1d/1w, right, delta range,
   expiration, exact contract), `GET /underlying/bars` (same full set of
   `agg` periods now, not just 1m), `GET /contracts` (filterable by ticker,
-  expiration range, right).
-  Limit/offset pagination throughout, capped at 20,000 rows/request.
+  expiration range, right), and `GET /metadata` (no filters — a quick
+  summary of what data actually exists: which tickers have any
+  `option_bars_1m` rows, each ticker's observed time range, and a total
+  row count, useful for a client to sanity-check coverage before querying
+  bars).
+  Limit/offset pagination on the three bar/contract endpoints, capped at
+  20,000 rows/request (`/metadata` isn't paginated — it's a fixed-shape
+  summary, not a filtered list).
   Optional `X-API-Key` header auth (`API_KEY` env var — unset by default,
   fine for a private-network deployment). `service/db/views.py` defines
   lightweight (non-ORM) typed table references for the Task 7 continuous
@@ -162,10 +168,14 @@ curl "http://localhost:8000/underlying/bars?ticker=SPY&start=2026-07-01T00:00:00
 
 # Which contracts are/were tracked for SPY, expiring in a given window
 curl "http://localhost:8000/contracts?ticker=SPY&start=2026-07-01&end=2026-07-31"
+
+# Quick summary of what data exists: tracked tickers, each one's date range, total row count
+curl "http://localhost:8000/metadata"
 ```
 
-All three endpoints paginate via `limit`/`offset` (default limit 1000, max 20000) — check the response's
-`returned` field against `limit`: if they're equal, there may be more data, page with `offset`.
+`/options/bars`, `/underlying/bars`, and `/contracts` paginate via `limit`/`offset` (default limit 1000,
+max 20000) — check the response's `returned` field against `limit`: if they're equal, there may be more
+data, page with `offset`. `/metadata` is unpaginated (fixed-shape summary, not a filtered list).
 
 If `API_KEY` is set in `.env`, every request needs a matching `X-API-Key` header (`/health` and `/` are
 exempt).

@@ -41,7 +41,7 @@ async def health() -> dict:
 async def root() -> dict:
     return {
         "service": "options-data-service",
-        "endpoints": ["/options/bars", "/underlying/bars", "/contracts"],
+        "endpoints": ["/metadata", "/options/bars", "/underlying/bars", "/contracts"],
         "health_check": "/health",
         "docs": "/docs",
     }
