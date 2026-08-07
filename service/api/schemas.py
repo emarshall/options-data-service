@@ -96,3 +96,23 @@ class ContractsResponse(BaseModel):
     limit: int
     offset: int
     returned: int
+
+
+class GapOut(BaseModel):
+    start: datetime
+    end: datetime
+    minutes: int
+
+
+class GapsResponse(BaseModel):
+    """See GET /gaps's docstring (routes.py) for what counts as a gap and
+    the known caveats (holidays, retention window) — deliberately kept out
+    of this schema's docstring since it's the same explanation either way
+    and belongs in one place."""
+
+    ticker: str
+    start: datetime
+    end: datetime
+    gaps: list[GapOut]
+    gap_count: int
+    total_missing_minutes: int

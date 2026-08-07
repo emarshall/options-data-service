@@ -348,3 +348,123 @@ async def test_one_contract_failing_does_not_block_the_rest(db_session_factory):
 
     assert summary["contracts_failed"] == 1
     assert summary["option_bars_written"] == 1  # the good one still got written
+
+
+# --- Incremental start time (efficiency fix) ---
+
+
+@pytest.mark.asyncio
+async def test_second_run_requests_from_latest_bar_not_full_lookback(db_session_factory):
+    """The efficiency fix this is testing: once a contract has data on
+    disk, a subsequent run should ask the source for candles starting
+    from its latest known bar, not the full lookback window all over
+    again."""
+    source = FakeSource()
+    exp = date.today() + timedelta(days=10)
+    source.chains["SPY"] = {exp: [FakeOption("SPY_C450", exp, 450.0, "C", days_to_expiration=10)]}
+    source.greeks_snapshot = {"SPY_C450": 0.5}
+    bar_time = datetime.now(timezone.utc) - timedelta(days=5)
+    source.candles["SPY_C450"] = [FakeCandle(_ms(bar_time))]
+
+    # capture_underlying_bars=False here specifically so this test only has
+    # to reason about the one option contract's request count, not also the
+    # separate underlying-ticker request that _settings()'s default would add.
+    job = BackfillJob(
+        source, db_session_factory, _settings(capture_underlying_bars=False), lookback_days=60
+    )
+    await job.run()  # first run: full lookback, writes the one bar
+
+    calls_before = len([c for c in source.candle_requests if c[0] == "SPY_C450"])
+    await job.run()  # second run: should request starting from bar_time, not 60 days ago
+    option_calls_after = [c for c in source.candle_requests if c[0] == "SPY_C450"]
+
+    assert len(option_calls_after) == calls_before + 1
+    second_start_time = option_calls_after[-1][2]
+    # Should be much closer to bar_time (5 days ago) than to the 60-day lookback start.
+    assert abs((second_start_time - bar_time).total_seconds()) < 5
+
+
+@pytest.mark.asyncio
+async def test_full_rescan_flag_forces_full_lookback_every_run(db_session_factory):
+    source = FakeSource()
+    exp = date.today() + timedelta(days=10)
+    source.chains["SPY"] = {exp: [FakeOption("SPY_C450", exp, 450.0, "C", days_to_expiration=10)]}
+    source.greeks_snapshot = {"SPY_C450": 0.5}
+    bar_time = datetime.now(timezone.utc) - timedelta(days=5)
+    source.candles["SPY_C450"] = [FakeCandle(_ms(bar_time))]
+
+    job = BackfillJob(source, db_session_factory, _settings(), lookback_days=60, full_rescan=True)
+    await job.run()
+    await job.run()
+
+    lookback_start = datetime.now(timezone.utc) - timedelta(days=60)
+    _, _, second_start_time = source.candle_requests[-1]
+    assert abs((second_start_time - lookback_start).total_seconds()) < 5
+
+
+@pytest.mark.asyncio
+async def test_underlying_also_gets_incremental_start_time(db_session_factory):
+    source = FakeSource()
+    bar_time = datetime.now(timezone.utc) - timedelta(days=3)
+    source.candles["SPY"] = [FakeCandle(_ms(bar_time))]
+
+    job = BackfillJob(source, db_session_factory, _settings(), lookback_days=60)
+    await job.run()
+    await job.run()
+
+    underlying_calls = [c for c in source.candle_requests if c[0] == "SPY"]
+    assert len(underlying_calls) == 2
+    assert abs((underlying_calls[-1][2] - bar_time).total_seconds()) < 5
+
+
+# --- Underlying gap reconciliation ---
+
+
+@pytest.mark.asyncio
+async def test_reconcile_underlying_gaps_reports_none_when_fully_covered(db_session_factory):
+    from service.ingestion.gap_detection import expected_bar_minutes
+
+    source = FakeSource()
+    start = datetime.now(timezone.utc) - timedelta(days=1)
+    end = datetime.now(timezone.utc)
+    minutes = expected_bar_minutes(start, end)
+
+    job = BackfillJob(source, db_session_factory, _settings())
+    async with db_session_factory() as session:
+        for m in minutes:
+            session.add(UnderlyingBar1m(time=m, ticker="SPY", open=1, high=1, low=1, close=1))
+        await session.commit()
+
+    result = await job.reconcile_underlying_gaps("SPY", start, end)
+
+    assert result == {"ticker": "SPY", "gaps_found": 0, "gaps_reconciled": 0, "bars_written": 0}
+    assert source.candle_requests == []  # nothing requested — no gap, nothing to do
+
+
+@pytest.mark.asyncio
+async def test_reconcile_underlying_gaps_backfills_from_earliest_gap(db_session_factory):
+    from service.ingestion.gap_detection import expected_bar_minutes
+
+    source = FakeSource()
+    start = datetime.now(timezone.utc) - timedelta(days=2)
+    end = datetime.now(timezone.utc)
+    minutes = expected_bar_minutes(start, end)
+    assert len(minutes) > 20
+    midpoint = minutes[len(minutes) // 2]
+
+    job = BackfillJob(source, db_session_factory, _settings())
+    async with db_session_factory() as session:
+        # Only the first half is present — a real gap starting at the midpoint.
+        for m in minutes[: len(minutes) // 2]:
+            session.add(UnderlyingBar1m(time=m, ticker="SPY", open=1, high=1, low=1, close=1))
+        await session.commit()
+
+    source.candles["SPY"] = [FakeCandle(_ms(midpoint))]  # what the "server" has for the gap
+
+    result = await job.reconcile_underlying_gaps("SPY", start, end)
+
+    assert result["gaps_found"] >= 1
+    assert result["bars_written"] == 1
+    calls = [c for c in source.candle_requests if c[0] == "SPY"]
+    assert len(calls) == 1
+    assert abs((calls[0][2] - midpoint).total_seconds()) < 5  # requested from the gap, not `start`

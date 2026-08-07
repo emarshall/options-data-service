@@ -16,6 +16,12 @@ services:
       retries: 10
       start_period: 20s
     restart: unless-stopped
+    # No resource limits set — see "Task 10: resource limits" in README.md
+    # for why (personal-project scale, and a hard cap on Postgres risks a
+    # crash-loop instead of graceful degradation). Uncomment and size to
+    # your hardware if you want a ceiling:
+    # mem_limit: 2g
+    # cpus: 2.0
 
   # One-shot: applies Alembic migrations, then exits. ingestion/api wait for
   # this to complete successfully before starting (see depends_on below) so
@@ -45,6 +51,17 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+    # No Docker healthcheck here (deliberate, not an oversight): unlike
+    # `api`, this process exposes no HTTP endpoint to probe, so there's
+    # nothing meaningful for `docker compose ps`/`--wait` to check beyond
+    # "the process didn't crash" — which `restart: unless-stopped` already
+    # covers. Real liveness monitoring (e.g. "no new bars in N minutes
+    # during market hours") is explicitly Task 11's job, deferred as
+    # lowest-priority in PLAN.md. In the meantime: `docker compose logs -f
+    # ingestion`, or query `/metadata` on the API for each ticker's latest
+    # observed bar timestamp.
+    # mem_limit: 512m
+    # cpus: 1.0
 
   api:
     build: .
@@ -62,6 +79,25 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+    healthcheck:
+      # Plain stdlib call, not curl — avoids adding curl to the shared
+      # image (Dockerfile) just for this. Hits the real /health endpoint
+      # and checks its body, not just that *a* response came back:
+      # /health always returns HTTP 200 even when the DB is unreachable
+      # (status: "degraded" in the body — see service/api/main.py), so a
+      # plain "did the request succeed" check would report healthy right
+      # through a DB outage. This fails the healthcheck in that case too.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import json,sys,urllib.request as u; d=json.load(u.urlopen('http://localhost:8000/health', timeout=3)); sys.exit(0 if d.get('status')=='ok' else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # mem_limit: 512m
+    # cpus: 1.0
 
   # On-demand: backfills ~6 weeks of historical 1m candles for all tracked
   # contracts + underlyings (Task 5). Idempotent — safe to run repeatedly,
@@ -106,6 +142,35 @@ services:
         condition: service_completed_successfully
     restart: "no"
     profiles: ["greeks-backfill"]
+
+  # On-demand, occasional-use companion to the plain `backfill` service
+  # above (which is now incremental-by-default — see PLAN.md Section 9/the
+  # underlying-backfill bug entry in Section 7 — so it no longer re-scans
+  # everything on every run). This one does re-scan everything in the
+  # lookback window specifically to find and fill real gaps (missing
+  # minutes for a continuously-quoted underlying), not just catch up since
+  # the last known bar — slower, so it's not meant to run on every
+  # schedule tick the way `backfill` is. Recommended cadence: daily, via
+  # host cron/systemd timer (there's no in-process scheduler for this —
+  # see Task 11 in PLAN.md, deliberately deferred), e.g.:
+  #   0 6 * * * cd /path/to/options-service && docker compose run --rm gap-reconcile
+  # Check what it found/fixed via `GET /gaps` (service/api/routes.py) or
+  # this container's own logs.
+  gap-reconcile:
+    build: .
+    command: python -m service.ingestion.backfill --reconcile-underlying-gaps
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    profiles: ["gap-reconcile"]
 
 volumes:
   timescale_data:

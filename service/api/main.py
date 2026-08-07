@@ -13,8 +13,9 @@ from fastapi import FastAPI
 from service.api.routes import router
 from service.config.settings import get_settings
 from service.db.session import check_connection
+from service.logging_config import configure_logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+configure_logging("api", get_settings().log_level)
 log = logging.getLogger("api")
 
 app = FastAPI(

@@ -101,8 +101,10 @@ These were discussed and decided — do not revisit without good reason.
 
 - ~~Exact historical candle depth for option contracts on TastyTrade's retail tier~~ **RESOLVED** —
   see Task 0 findings above (~6 weeks trailing, 1-minute, survives expiration).
-- Exact list of initial tickers and per-ticker delta ranges — can be decided at config time (Task 1/9),
-  doesn't block earlier tasks.
+- ~~Exact list of initial tickers and per-ticker delta ranges — can be decided at config time (Task
+  1/9)~~ **RESOLVED (Task 9):** `config.yaml` tracks SPX/NDX (0.15-0.85 call delta, 10 DTE cap,
+  AM-settled excluded) and VIX (same delta range, 45 DTE cap, AM-settled *included* — see Task 9's log
+  entry for why VIX needs that exception).
 - Retention policy specifics (e.g., compress after 7 days, drop raw ticks after N months if we ever
   ingest tick-level data) — decide during Task 7 once real data volume is observed.
 - Whether to also capture underlying (stock/index) 1m bars alongside options, to support Black-Scholes
@@ -623,41 +625,105 @@ front fails a test instead of only showing up at request time.
 ---
 
 ### Task 9 — Config Finalization, Contract Roll Scheduling, AM-Settlement Handling
-**Status:** NOT STARTED
+**Status:** DONE (2026-08-06)
 
-**Purpose:** Tie together the scheduling details left open in Task 3 — specifically same-day 0DTE
-listing detection, and the AM-settlement exclusion logic — plus finalize the real config file with
-actual tickers/delta ranges the user wants to track.
+**What was delivered:**
+- **AM-settlement exclusion required no new code.** Checked this first, before touching scheduling,
+  since the plan explicitly called out the risk of sourcing settlement type from the wrong place (a
+  DXLink streaming field) rather than instrument metadata. `ContractManager` (Task 3) already resolves
+  contracts via `TastyTradeSource.get_option_chain()`, which calls the `tastytrade` SDK's
+  `instruments.get_option_chain()` — the instruments API, not DXLink — and `settlement_type` on the
+  resulting objects is exactly that instrument-level metadata. `tests/test_contract_manager.py` already
+  covered this (AM contracts excluded, PM contracts kept). Nothing to change; recorded here so this
+  doesn't get re-litigated later as if it were still open.
+- **Adaptive contract-refresh cadence** (`service/ingestion/pipeline.py`, `service/config/settings.py`):
+  the refresh loop now runs on two cadences instead of one fixed interval — a faster one
+  (`CONTRACT_REFRESH_FAST_INTERVAL_S`, default 30s) during a configurable window around market open
+  (`CONTRACT_REFRESH_FAST_WINDOW_START`/`_END`, default 09:25-10:00 America/New_York, weekdays only), and
+  the normal cadence (`CONTRACT_REFRESH_INTERVAL_S`, default 300s, unchanged from before) the rest of the
+  time. This is what gets a same-day/0DTE listing subscribed to promptly without polling the fast cadence
+  all day. All four values are env-configurable (previously `contract_refresh_interval_s` was a
+  constructor-only parameter that `main.py` never actually wired to config at all — real gap, now
+  fixed). Weekend detection means Sat/Sun always use the normal cadence regardless of time-of-day, since
+  nothing new lists then.
+  **Open item, deliberately not resolved here:** the plan asks for the window to be "informed by real
+  observation of when TastyTrade lists same-day 0DTE contracts" — no such observation data exists yet
+  (would require logging refresh diffs over live trading days). Shipped with a reasoned default (window
+  bracketing the 9:30 ET open) instead of blocking on data collection; narrow/shift the window later using
+  real refresh-diff logs once there's evidence for a different range. `PLAN.md`'s own "Open questions"
+  for this task already flagged this as "operational tuning," not a blocker.
+- **Config finalized:** `config.yaml` already had real tickers (SPX, NDX, VIX — not the SPY/QQQ example
+  values) from a prior editing session; the file's header comment was stale, still describing the Task
+  3-era state where it wasn't wired into contract selection at all. Updated the comment, and — more
+  importantly — **caught and documented a real correctness issue while reviewing it**: VIX had
+  `exclude_am_settled: false` set, which looked like an inconsistency next to SPX/NDX's `true` until
+  checked against how VIX actually settles. Confirmed (via Cboe's own VIX options settlement
+  documentation) that *every* VIX option is AM-settled — unlike SPX/NDX, where AM vs PM is a per-contract
+  distinction — so leaving the default `true` on VIX would exclude 100% of its contracts and silently
+  track nothing for that ticker. The existing `false` was correct; it just wasn't explained anywhere, so
+  a future edit could easily "fix" it into a bug. Added that explanation directly in `config.yaml` and in
+  the new README section on configuring tickers.
+- 3 new unit tests (`tests/test_pipeline.py`) covering: cadence switches correctly across the fast
+  window's boundaries (inclusive start/end) and outside it, weekends always use the normal cadence even
+  during the window's time-of-day, custom (non-default) window/interval values are honored, and explicit
+  constructor args still override settings (kept for tests/future callers that want to force a cadence
+  directly). 135 tests total in the repo now (133 run, 2 opt-in Postgres tests skipped as designed).
 
-**How it fits in:** Operational polish on top of Task 3/4.
+**Validated by:** all 3 new tests plus the full existing suite, no regressions (136 total).
 
-**Implementation plan:**
-- Scheduler (e.g. APScheduler or a simple asyncio loop) running the contract refresh job from Task 3 on
-  an appropriate cadence, informed by real observation of when TastyTrade lists same-day 0DTE contracts.
-- AM-settlement exclusion: identify via instrument metadata from TastyTrade's instruments API (not
-  DXLink) — settlement type is account/instrument metadata, not a streaming event field.
-
-**Open questions:** none blocking, mostly operational tuning.
-
-**Deliverables:** finalized `config.yaml`, scheduler wiring.
+**Deliverables:** `service/config/settings.py`, `service/ingestion/pipeline.py`, `.env.example`,
+`config.yaml`, `config.example.yaml` (all updated); `tests/test_pipeline.py` (extended).
 
 ---
 
 ### Task 10 — Docker Compose Finalization & Deployment Docs
-**Status:** NOT STARTED
+**Status:** DONE (2026-08-06)
 
-**Purpose:** Final polish pass: make sure `docker-compose up` on a fresh machine works end to end,
-document setup (TastyTrade credential acquisition, config, first run, how to verify data is flowing).
+**What was delivered:**
+- **Reviewed restart policies:** `timescaledb`/`ingestion`/`api` already had `restart: unless-stopped`
+  from Task 1 — correct, no change needed. `migrate`/`backfill`/`greeks-backfill` correctly use
+  `restart: "no"` (one-shot jobs; auto-restarting a completed migration or backfill run would be wrong).
+- **Reviewed healthchecks:** `timescaledb` already had one (`pg_isready`, Task 1). `api` had none — added
+  one that calls its own real `/health` endpoint via a plain stdlib Python one-liner (no `curl` added to
+  the shared `Dockerfile` just for this) and specifically checks the JSON body's `status` field, not just
+  "did a response come back" — `/health` returns HTTP 200 even when the DB is unreachable (`status:
+  "degraded"` in the body), so a naive check would report healthy straight through a DB outage.
+  `ingestion` deliberately still has none: it has no HTTP surface to probe, so there's nothing for a
+  healthcheck to check beyond "is the process alive," which `restart: unless-stopped` already covers.
+  Real liveness monitoring for it is Task 11's job (explicitly deferred, lowest priority).
+- **Reviewed resource limits:** none existed, and none were added as hard enforcement — added as
+  commented-out `mem_limit`/`cpus` lines per service instead, sized as reasonable starting points if
+  uncommented. Deliberate, not an oversight: a hard memory cap on `timescaledb` specifically risks turning
+  a transient spike (e.g. during continuous aggregate refresh) into an OOM crash-loop rather than just
+  slowing down, and this is explicitly a personal-project-scale deployment (per `PLAN.md`'s own framing
+  throughout), not a multi-tenant environment where isolation matters more than availability. Documented
+  the reasoning in both `docker-compose.yml`'s comments and the new README section so it reads as a
+  decision, not a gap.
+- **README.md rewritten** to match reality instead of Task 1's now-stale framing (it still described
+  itself as "the Task 1 deliverable" with "real streaming logic lands in Tasks 2-4," despite Tasks 1-9
+  being done). Restructured around actually setting the thing up end to end: TastyTrade credential
+  acquisition moved to an explicit step 0 (previously buried in its own section past the API docs), a new
+  "verify data is flowing" section with concrete commands and what to check if each one doesn't look
+  right, a "configuring tickers" section (including the VIX AM-settlement note from Task 9 above — the
+  kind of thing that belongs where someone is about to edit `config.yaml`, not just in `PLAN.md`), and a
+  new "operating this deployment day to day" section covering the restart-policy/healthcheck/
+  resource-limit decisions above so they're explained once, next to where someone would actually look for
+  them, rather than only living in this PLAN.md log. Trimmed the old per-task file-by-file changelog
+  (redundant with this document) down to a status summary plus a pointer here for detail.
+- **Smoke-tested what's feasible in this environment:** `docker compose config`-equivalent YAML
+  validation (parses cleanly, healthcheck `test` arrays well-formed) and the healthcheck's Python
+  one-liner exercised directly (confirms it fails cleanly, not with a syntax error, against an
+  unreachable endpoint). **Could not smoke-test an actual `docker compose up --build` end-to-end** — no
+  Docker daemon available in this environment (same constraint noted for the Task 7 continuous
+  aggregates, Section 2). This is the one item from the task's implementation plan not independently
+  verified here; worth a real `docker compose up --build` on a real machine before treating this as fully
+  closed, same caveat as the continuous aggregate migrations already carry.
 
-**How it fits in:** Wraps up the "docker compose yaml" deliverable and makes the whole thing usable by
-future-you on a different machine.
+**Validated by:** full test suite re-run after all Task 9/10 changes (133 passed, 2 skipped, no
+regressions); YAML/script syntax checks described above. Real `docker compose up` on a clean machine is
+still outstanding — see caveat above.
 
-**Implementation plan:**
-- Review all services' restart policies, healthchecks, resource limits.
-- Write a `README.md` covering setup end to end.
-- Smoke test on a clean environment.
-
-**Deliverables:** finalized `docker-compose.yml`, `README.md`.
+**Deliverables:** `docker-compose.yml` (updated), `README.md` (rewritten).
 
 ---
 
@@ -998,6 +1064,144 @@ appeared to run indefinitely.
   method's own docstring pointing at a different method ("use X instead") is worth treating as a hard
   requirement, not a suggestion, especially after this project has now hit two separate bugs from
   under-using a library's dedicated methods in favor of a hand-rolled equivalent.
+
+**[Post-Task 10, found from a real deployment's live symptoms]** Underlying (`SPX`) bars only ever
+covered the last few days, while option-contract bars for the same period went back the full ~6-week
+retention window — reported by the user querying `/underlying/bars` vs. `/options/bars` for the same
+range and getting drastically different coverage.
+- **Symptom:** `GET /underlying/bars?ticker=SPX&start=<6 weeks ago>&end=<now>` returned ~22 rows, all
+  from the most recent few days; the equivalent `/options/bars` query for the same window returned the
+  full 15000+ row page limit, going back the entire window. Also very likely the cause of a second
+  reported symptom — many bars at larger `agg` periods (e.g. `agg=30m`) having identical
+  open/high/low/close: a 30-minute bucket built from only one real 1-minute bar (because the rest of
+  that half hour is missing) has no actual range to show, so open=high=low=close is exactly what you'd
+  expect from sparse underlying coverage, not a separate aggregation bug.
+- **Root cause:** `TastyTradeSource.request_candles()`'s `collect_events()` call used `max_count=5000`
+  and `timeout_s=30.0` — sized around a single option contract's candle history, which is naturally
+  sparse (a contract often has no quote activity in a given minute). An underlying index is quoted
+  essentially every market minute; a 60-day lookback is up to ~60 * 390 ≈ 23,400 1-minute candles —
+  several times the old count cap, and plausibly more than 30 seconds of real transfer time over the
+  shared websocket. Whichever limit was hit first silently truncated the result to whatever had arrived
+  so far, with no error — indistinguishable, from the caller's side, from "that's genuinely all the data
+  there is." Option contracts never hit either limit because their real candle counts stayed well under
+  5000 even across the full retention window.
+- **Fix:** Raised `max_count` to 100,000 and `timeout_s` to 240.0 in `request_candles()` — the
+  `idle_timeout_s=3.0` mechanism already in place remains the real stopping condition for the common
+  (sparse) case, so this doesn't slow down a typical option-contract call at all; it only raises the
+  ceiling for the dense underlying case. Added a warning log if `max_count` is ever actually hit, so a
+  future truncation (e.g. from an even longer lookback window) fails loudly instead of silently again.
+- **Not independently re-verified against a real TastyTrade account** in this environment (no live
+  credentials/network access here) — the reasoning above is code-verified (the old limits are
+  arithmetically too small for continuous underlying quoting over the configured lookback) but worth
+  confirming with a real `docker compose run --rm backfill` on a live deployment before treating this as
+  fully closed.
+- **Files:** `service/sources/tastytrade.py` (`request_candles`).
+
+**[Post-Task 10]** `ingestion`/`backfill` produced enough log volume to crash Docker on an HDD-backed
+host — reported as a real operational problem, not a hypothetical.
+- **Symptom:** Extremely high log output; on at least one deployment (magnetic HDD, not SSD), enough
+  sustained write I/O from Docker capturing container logs to eventually crash the daemon.
+- **Root cause, confirmed by reading the installed `tastytrade` package's own source** (not a guess):
+  `tastytrade/__init__.py` runs `logging.getLogger(__name__).setLevel(logging.DEBUG)` unconditionally at
+  import time, on the top-level `"tastytrade"` logger. Every submodule (`tastytrade.streamer`,
+  `tastytrade.session`, etc.) gets its logger via `logging.getLogger(__name__)` and sets no level of its
+  own, so all of them inherit DEBUG from that ancestor — not from whatever this app's own
+  `logging.basicConfig(level=logging.INFO)` put on the *root* logger, since Python's logging resolves a
+  logger's effective level by walking up to the nearest ancestor that has one explicitly set, and
+  `tastytrade`'s self-`setLevel` sits in between `tastytrade.streamer` and root. `tastytrade/streamer.py`
+  then does `logger.debug("received message: %s", data)` on every single websocket message —
+  effectively logging the full raw JSON payload of every Quote/Greeks/Candle event received, for however
+  many contracts are subscribed. This app's own code was never the source of the flood; no `service/*`
+  module logs per-event payloads anywhere.
+- **Fix:** Added `service/logging_config.py`, called from every entry point (`ingestion/main.py`,
+  `api/main.py`, `ingestion/backfill.py`, `greeks/backfill_job.py`) in place of a bare
+  `logging.basicConfig()`. It sets root to WARNING, this app's own loggers (`service.*` plus each entry
+  point's top-level name) to a configurable level (new `LOG_LEVEL` setting, default INFO), and explicitly
+  clamps `tastytrade` (plus a few other libraries known for similar raw-frame-logging behavior — httpx,
+  httpcore, websockets, hpack — defensively, without the same level of confirmed evidence) to WARNING
+  regardless of `LOG_LEVEL`, so requesting DEBUG for this app's own code can't accidentally re-enable the
+  flood. Also added an opt-in (DEBUG-only) per-bar log line in `IngestionPipeline` — contract, right,
+  expiration, strike, delta, close — addressing the follow-up request for *some* per-record visibility
+  without reintroducing raw-payload-level volume.
+- **Verification:** new `tests/test_logging_config.py` imports the real `tastytrade` package and asserts
+  against its actual current logger configuration (confirms it really does self-set DEBUG, and that
+  `configure_logging()` really does override it) rather than a synthetic stand-in for the dependency —
+  the point was confirming the fix beats *this specific* real behavior. 6 new tests, all passing.
+- **Files:** `service/logging_config.py` (new), `service/config/settings.py` (`log_level` field),
+  `service/ingestion/main.py`, `service/api/main.py`, `service/ingestion/backfill.py`,
+  `service/greeks/backfill_job.py`, `service/ingestion/pipeline.py`, `tests/test_logging_config.py` (new).
+- **General lesson:** `logging.basicConfig(level=X)` only sets the *root* logger's level — it has no
+  effect on a logger anywhere in the hierarchy that has explicitly called its own `setLevel()`, which a
+  dependency doing its own internal debug logging may well have done. When a process is unexpectedly
+  chatty, check `logging.getLogger("<top-level dependency name>").level` directly rather than assuming
+  the app's own `basicConfig` call is authoritative.
+
+**[Post-Task 10]** `BackfillJob.run()` always re-requested and re-scanned the entire lookback window on
+every invocation, regardless of what was already on disk — reported as 15-30 minute runs that often
+wrote zero new rows.
+- **Symptom:** Every scheduled/manual backfill run took as long as the very first one, even when the
+  vast majority of the window was already correctly backfilled.
+- **Root cause:** `_backfill_option_contract`/`_backfill_underlying` always requested candles starting
+  from `now - lookback_days`, and relied entirely on the existing per-row "does this already exist"
+  dedup check to avoid duplicating data. That check is correct but happens *after* the (slow) network
+  request and event collection — so re-fetching weeks of already-correct data, only to discard nearly
+  all of it, was the dominant cost of every run past the first.
+- **Fix:** `run()` now computes, per contract/ticker, the later of `window_start` and that specific
+  contract/ticker's latest existing bar timestamp (one batched `GROUP BY MAX(time)` query, not one query
+  per candidate), and requests from there instead. A contract/ticker with no existing data still gets the
+  full lookback (first-run behavior unchanged). Added a `full_rescan` flag (`--full` on the CLI) to
+  restore the old always-full-lookback behavior for an occasional deliberate deep re-verify. This is
+  purely a request-size optimization sitting on top of the existing dedup check, not a replacement for
+  it — safe to toggle either way at any time without risk of duplicating data.
+- **Deliberate non-goal:** this alone does not detect or fix a gap *earlier* than a contract/ticker's
+  latest bar (e.g. an outage in the middle of an otherwise-current history) — it only looks at the single
+  most-recent timestamp. That's handled separately by gap detection/reconciliation (next two entries).
+- **Files:** `service/ingestion/backfill.py` (`run`, new `_effective_start_times`/`_as_utc`),
+  `tests/test_backfill.py`.
+
+**[Post-Task 10]** No way to detect or fix gaps in already-backfilled underlying data (e.g. missing
+whole days between two known-good ranges, or a missing hour within an otherwise-complete day) — raised
+as a feature request alongside the two bugs above, and worth building since the underlying-truncation
+bug above means real deployments likely have exactly this kind of gap in their existing data even after
+that fix.
+- **What was added:** `service/ingestion/gap_detection.py` — `expected_bar_minutes()` generates every
+  regular-trading-hours minute (09:30-16:00 America/New_York, weekdays) in a range; `find_gaps()` diffs
+  that against a set of actually-present timestamps and merges consecutive missing minutes into
+  contiguous `Gap` ranges. Deliberately scoped to underlying tickers only, not option contracts — an
+  option contract having no quotes for long stretches is normal, not a data-integrity problem, so the
+  same "missing minute = gap" definition would produce constant false positives there; see the module's
+  own docstring for the full reasoning, plus a documented limitation that it doesn't know about market
+  holidays (a holiday reads as a false-positive gap spanning that whole session).
+- **Reconciliation:** `BackfillJob.reconcile_underlying_gaps(ticker, start, end)` — new, separate from
+  the routine `run()` path above — scans the *entire* given range (not just "since the latest bar"),
+  and if any gaps are found, re-requests candles starting from the *earliest* one; a single streaming
+  request naturally covers every subsequent gap too, with existing-row dedup making the redundant
+  re-coverage of already-correct data in between harmless (just somewhat wasteful — acceptable for a
+  job explicitly meant to run occasionally, unlike `run()` where that waste was exactly what got
+  optimized away). Exposed via `--reconcile-underlying-gaps` on the `backfill` CLI and a new
+  `gap-reconcile` docker-compose service (profile-gated, like `backfill`/`greeks-backfill`).
+- **Reporting:** new `GET /gaps?ticker=&start=&end=` endpoint (separate from `/metadata` on purpose,
+  per the user's own suggestion — it's a real full-range table scan, not `/metadata`'s cheap
+  MIN/MAX/COUNT, so it shouldn't run as part of every `/metadata` call; capped at 120 days per request
+  for the same reason).
+- **Known, unavoidable limit:** none of this can recover data older than TastyTrade's ~6-week candle
+  retention window (Task 0's confirmed finding) — a gap that old will keep showing up in `/gaps` and
+  reconciliation will not clear it, because the underlying data simply no longer exists on the feed.
+- **Automation:** deliberately *not* built as an in-process scheduler — Task 11 (monitoring/alerting,
+  including any kind of internal scheduling) is explicitly deferred as lowest-priority/optional in this
+  plan, and adding a scheduler here would be scope creep beyond what was asked. Documented host
+  cron/systemd timer as the recommended way to run `gap-reconcile` on a regular cadence instead (see
+  README.md).
+- **Verification:** 10 new tests for `gap_detection.py` (including the two exact scenarios from the
+  bug report — a multi-hour intraday gap, and a multi-week gap), 4 new tests for
+  `reconcile_underlying_gaps`/incremental-start behavior in `test_backfill.py`, and 6 new integration
+  tests for `GET /gaps` in `test_api.py` (fully covered range, the intraday-gap scenario, a
+  different-ticker's data not counting as coverage, the 400s for invalid input, and `min_gap_minutes`
+  filtering). 160 tests total, all passing (2 skipped, unchanged — still the opt-in Postgres-only test).
+- **Files:** `service/ingestion/gap_detection.py` (new), `service/ingestion/backfill.py`
+  (`reconcile_underlying_gaps`), `service/api/routes.py` (`GET /gaps`), `service/api/schemas.py`
+  (`GapOut`, `GapsResponse`), `docker-compose.yml` (`gap-reconcile` service), `tests/test_gap_detection.py`
+  (new), `tests/test_backfill.py`, `tests/test_api.py`.
 
 **Template for new entries** (copy this when adding one):
 

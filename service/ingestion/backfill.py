@@ -52,11 +52,12 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from service.config.settings import AppConfig
 from service.db.models import Contract, OptionBar1m, UnderlyingBar1m
 from service.ingestion.contract_manager import ContractManager, ResolvedContract
+from service.ingestion.gap_detection import find_gaps
 from service.sources._async_utils import get_attr_any
 from service.sources.base import MarketDataSource
 
@@ -75,22 +76,55 @@ class BackfillJob:
         session_factory,
         settings: AppConfig,
         lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+        full_rescan: bool = False,
     ):
         self._source = source
         self._session_factory = session_factory
         self._settings = settings
         self._lookback_days = lookback_days
+        # See `run()`'s docstring — False (the default) is the fast,
+        # every-run-safe mode added to fix a real reported problem
+        # (15-30 minute runs re-requesting data already on disk every
+        # single time). True restores the original always-full-lookback
+        # behavior, for the occasional deliberate deep re-verify.
+        self._full_rescan = full_rescan
         self._contract_manager = ContractManager(source, session_factory, settings.tickers)
 
     async def run(self) -> dict:
         """Resolves the current contract set, then backfills 1m candles for
         every tracked option contract plus each configured underlying.
         Returns a summary dict (also logged) — useful for the smoke test
-        and for tests to assert against."""
-        diff = await self._contract_manager.refresh()
-        start_time = datetime.now(timezone.utc) - timedelta(days=self._lookback_days)
+        and for tests to assert against.
 
-        candidates = await self._get_backfill_candidates(diff.current, start_time)
+        **Incremental by default (`full_rescan=False`):** for each
+        contract/underlying, requests candles starting from whichever is
+        later — the full lookback window, or the latest bar timestamp
+        already on disk for that specific contract/ticker — instead of
+        always re-requesting the entire lookback window from scratch every
+        run. A contract/ticker with no existing data at all still gets the
+        full lookback (first-run/newly-discovered-contract behavior is
+        unchanged). This is what makes routine re-runs (e.g. a scheduled
+        "catch up since last run" job) fast: a ticker with days of
+        already-backfilled history only requests the small amount of new
+        data since its last known bar, rather than re-fetching and
+        re-checking-for-duplicates weeks of data that was already correct.
+        Existing-row dedup (see `_backfill_option_contract`/
+        `_backfill_underlying`) still applies on top of this regardless —
+        this is purely a request-size optimization, not a correctness
+        mechanism; it's safe to fall back to `full_rescan=True` at any time
+        without any risk of duplicating data.
+
+        **This does not, by itself, fix gaps earlier in the data** (e.g. a
+        multi-day outage that predates the latest bar) — it only looks at
+        the *latest* timestamp per contract/ticker, so an old hole followed
+        by more recent good data won't be noticed this way. That's what
+        `reconcile_underlying_gaps()` is for, as a separate, occasional
+        pass — see its docstring.
+        """
+        diff = await self._contract_manager.refresh()
+        window_start = datetime.now(timezone.utc) - timedelta(days=self._lookback_days)
+
+        candidates = await self._get_backfill_candidates(diff.current, window_start)
         recovered_count = len(candidates) - len(diff.current)
 
         summary = {
@@ -99,11 +133,14 @@ class BackfillJob:
             "underlyings_attempted": 0, "underlyings_failed": 0, "underlying_bars_written": 0,
         }
 
+        option_starts = await self._effective_start_times(
+            OptionBar1m, OptionBar1m.contract_id, list(candidates.keys()), window_start
+        )
         for contract_id, resolved in candidates.items():
             summary["contracts_attempted"] += 1
             try:
                 summary["option_bars_written"] += await self._backfill_option_contract(
-                    contract_id, resolved, start_time
+                    contract_id, resolved, option_starts[contract_id]
                 )
             except Exception:
                 summary["contracts_failed"] += 1
@@ -112,16 +149,100 @@ class BackfillJob:
                 )
 
         underlying_tickers = {t.ticker for t in self._settings.tickers if t.capture_underlying_bars}
+        underlying_starts = await self._effective_start_times(
+            UnderlyingBar1m, UnderlyingBar1m.ticker, list(underlying_tickers), window_start
+        )
         for ticker in underlying_tickers:
             summary["underlyings_attempted"] += 1
             try:
-                summary["underlying_bars_written"] += await self._backfill_underlying(ticker, start_time)
+                summary["underlying_bars_written"] += await self._backfill_underlying(
+                    ticker, underlying_starts[ticker]
+                )
             except Exception:
                 summary["underlyings_failed"] += 1
                 log.exception("Backfill failed for underlying %s — continuing with the rest.", ticker)
 
         log.info("Backfill summary: %s", summary)
         return summary
+
+    @staticmethod
+    def _as_utc(dt: datetime) -> datetime:
+        """SQLite (used in tests, and possible for a local dev DB) doesn't
+        preserve tzinfo on DateTime columns, so a value read back can come
+        out naive even though every timestamp this codebase writes is UTC
+        (see `_candle_time` below) — normalize so comparisons against
+        tz-aware datetimes elsewhere don't raise or silently mismatch."""
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    async def _effective_start_times(
+        self, model, key_column, keys: list[str], window_start: datetime
+    ) -> dict[str, datetime]:
+        """For each of `keys` (contract_ids or tickers), returns
+        `window_start` if `full_rescan` is set or no existing bar is found,
+        else the later of `window_start` and that key's latest existing bar
+        timestamp. One batched `GROUP BY` query rather than one query per
+        key — this runs on every single backfill invocation, so it's worth
+        keeping to a single round trip even with a few hundred candidates.
+        """
+        defaults = {k: window_start for k in keys}
+        if self._full_rescan or not keys:
+            return defaults
+
+        async with self._session_factory() as session:
+            stmt = (
+                select(key_column, func.max(model.time))
+                .where(key_column.in_(keys))
+                .group_by(key_column)
+            )
+            result = await session.execute(stmt)
+            for key, latest in result.all():
+                if latest is not None:
+                    defaults[key] = max(window_start, self._as_utc(latest))
+        return defaults
+
+    async def reconcile_underlying_gaps(
+        self, ticker: str, start: datetime, end: datetime, min_gap_minutes: int = 1
+    ) -> dict:
+        """Occasional-use companion to the fast incremental path in
+        `run()`: scans *all* of `[start, end]` for missing expected minutes
+        (via `service.ingestion.gap_detection`, so see that module's
+        docstring for what counts as a gap and its holiday caveat), and if
+        any are found, re-requests candles starting from the *earliest*
+        gap rather than the latest bar — one request naturally streams
+        through every subsequent gap too (existing-row dedup makes
+        re-covering already-correct data in between harmless, just
+        somewhat wasteful — acceptable for a deliberately-occasional job,
+        unlike the routine `run()` path where that waste is exactly what
+        was being optimized away).
+
+        Only meaningful for underlying tickers, not option contracts — see
+        `gap_detection`'s module docstring for why.
+
+        **Can't recover data older than TastyTrade's ~6-week candle
+        retention (Task 0 finding)** — a gap entirely outside that window
+        is real, reported, but permanently unfillable; this still attempts
+        the request (harmless — Task 0 confirmed over-requesting just
+        returns whatever's actually available) but don't expect it to
+        succeed for a gap that old.
+        """
+        async with self._session_factory() as session:
+            stmt = select(UnderlyingBar1m.time).where(
+                UnderlyingBar1m.ticker == ticker,
+                UnderlyingBar1m.time >= start,
+                UnderlyingBar1m.time <= end,
+            )
+            existing_times = {self._as_utc(t) for t in (await session.execute(stmt)).scalars().all()}
+
+        gaps = find_gaps(existing_times, start, end, min_gap_minutes=min_gap_minutes)
+        if not gaps:
+            return {"ticker": ticker, "gaps_found": 0, "gaps_reconciled": 0, "bars_written": 0}
+
+        earliest_gap_start = min(g.start for g in gaps)
+        written = await self._backfill_underlying(ticker, earliest_gap_start)
+        return {
+            "ticker": ticker, "gaps_found": len(gaps), "gaps_reconciled": len(gaps),
+            "bars_written": written,
+        }
 
     async def _get_backfill_candidates(
         self, live_resolved: dict[str, ResolvedContract], start_time: datetime
@@ -249,12 +370,30 @@ class BackfillJob:
 
 
 async def _main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from service.config.settings import get_settings as _get_settings
+    from service.logging_config import configure_logging
+
+    configure_logging("service.ingestion.backfill", _get_settings().log_level)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS,
         help=f"How far back to request candles (default {DEFAULT_LOOKBACK_DAYS}; "
              "over-requesting beyond the actual ~6-week retention window is harmless).",
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Ignore each contract/ticker's existing latest bar and always request the full "
+             "lookback window (the original, slower, every-run-from-scratch behavior). Useful "
+             "for an occasional deep re-verify; routine runs should omit this.",
+    )
+    parser.add_argument(
+        "--reconcile-underlying-gaps", action="store_true",
+        help="Instead of the normal backfill, scan each capture_underlying_bars ticker's full "
+             "lookback window for missing minutes (service.ingestion.gap_detection) and, for "
+             "any found, backfill from the earliest gap forward. Slower than a routine run "
+             "(scans everything rather than just 'since last bar') — meant to be run "
+             "occasionally/on-demand, not on every schedule tick. Does not touch option "
+             "contracts — see gap_detection's module docstring for why.",
     )
     args = parser.parse_args()
 
@@ -276,8 +415,22 @@ async def _main() -> None:
     try:
         log.info("Authenticating...")
         await source.authenticate()
-        job = BackfillJob(source, get_session_factory(), settings, lookback_days=args.lookback_days)
-        await job.run()
+        job = BackfillJob(
+            source, get_session_factory(), settings,
+            lookback_days=args.lookback_days, full_rescan=args.full,
+        )
+        if args.reconcile_underlying_gaps:
+            window_start = datetime.now(timezone.utc) - timedelta(days=args.lookback_days)
+            window_end = datetime.now(timezone.utc)
+            for ticker_cfg in settings.tickers:
+                if not ticker_cfg.capture_underlying_bars:
+                    continue
+                result = await job.reconcile_underlying_gaps(
+                    ticker_cfg.ticker, window_start, window_end
+                )
+                log.info("Gap reconciliation for %s: %s", ticker_cfg.ticker, result)
+        else:
+            await job.run()
     finally:
         await source.close()
 

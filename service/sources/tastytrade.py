@@ -322,12 +322,33 @@ class TastyTradeSource(MarketDataSource):
     # ------------------------------------------------------------------
 
     async def request_candles(
-        self, symbol: str, period: str, start_time: datetime
+        self, symbol: str, period: str, start_time: datetime,
+        timeout_s: float = 240.0, max_count: int = 100_000,
     ) -> list[Any]:
         """One-off historical candle pull. Per Task 0 findings: 1-minute
         option candle depth is capped at ~6 weeks regardless of how far
         back `start_time` requests, but requesting further back than that
-        is harmless (just returns whatever's actually available)."""
+        is harmless (just returns whatever's actually available).
+
+        **`timeout_s`/`max_count` bug fix (found investigating Task 9's
+        underlying-backfill issue — see PLAN.md Section 7):** the original
+        defaults here (30s / 5000 events) were sized around a single
+        option contract's candle history, which is naturally sparse (an
+        option often has no quote activity in a given minute). An
+        underlying index/ETF ticker, by contrast, is continuously quoted
+        essentially every market minute — a 60-day lookback is up to
+        ~60 * 390 ≈ 23,400 1-minute candles, several times the old 5000
+        cap, and potentially takes longer than 30s to fully stream over
+        the shared websocket. Whichever of the two limits was hit first
+        silently truncated the result to whatever had arrived so far,
+        with no error — indistinguishable from "that's just all the data
+        there is" from the caller's side. Both bumped well above any
+        realistic single-symbol candle count for the lookback windows this
+        service actually uses (`idle_timeout_s` below is still what ends a
+        typical, sparse, option-contract call quickly — these are just the
+        safety-net ceiling for the dense case, not the common-case
+        stopping condition).
+        """
         from tastytrade.dxfeed import Candle
 
         streamer = await self._ensure_streamer()
@@ -336,8 +357,8 @@ class TastyTradeSource(MarketDataSource):
         try:
             events = await collect_events(
                 streamer.listen(Candle),
-                timeout_s=30.0,  # hard safety cap — should rarely be hit now, see idle_timeout_s below
-                max_count=5000,  # safety net: an in-progress bar can otherwise stream forever
+                timeout_s=timeout_s,
+                max_count=max_count,  # safety net: an in-progress bar can otherwise stream forever
                 event_filter=lambda ev: symbol in str(get_attr_any(ev, "event_symbol", default="")),
                 idle_timeout_s=3.0,  # the real stopping condition in practice — see collect_events docstring
             )
@@ -346,6 +367,13 @@ class TastyTradeSource(MarketDataSource):
                 await self._unsubscribe_candle_compat(streamer, Candle, symbol, period, subscribed_via)
             except Exception as e:
                 log.warning("Candle unsubscribe for %s didn't complete cleanly: %s", symbol, e)
+
+        if len(events) >= max_count:
+            log.warning(
+                "request_candles(%s) hit max_count=%d — result may be truncated. "
+                "If this symbol legitimately has more history than that, raise max_count.",
+                symbol, max_count,
+            )
 
         return events
 

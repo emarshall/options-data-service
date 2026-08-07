@@ -109,24 +109,63 @@ class AppConfig(BaseSettings):
     risk_free_rate: float = Field(default=0.045, alias="RISK_FREE_RATE")
 
     # --- Query API (Task 8) ---
-    # Optional. If unset (the default, None), the API requires no auth —
-    # fine for a localhost/private-network deployment, per PLAN.md Task 8.
-    # If set, every request needs a matching X-API-Key header. Deliberately
-    # `None`, not `""`, as the "unset" sentinel — see service/api/auth.py,
-    # which checks `is None` specifically.
-    api_key: str | None = Field(default=None, alias="API_KEY")
-
-    # --- Query API (Task 8) ---
     # Optional lightweight guard, per the plan's own framing: this is meant
     # for local/private-network use, not a public service, so auth is
     # opt-in rather than mandatory. If set, every request must send this
     # value in an `X-API-Key` header; if unset (the default), the API is
     # open — appropriate for the common case of a home-server deployment
-    # only reachable on a private network.
+    # only reachable on a private network. Deliberately `None`, not `""`,
+    # as the "unset" sentinel — see service/api/auth.py, which checks a
+    # plain falsy value (covers both `None` and an accidentally-empty
+    # `API_KEY=` in `.env`).
     api_key: str | None = Field(default=None, alias="API_KEY")
+
+    # --- Contract refresh scheduling (Task 9) ---
+    # How often IngestionPipeline re-resolves each ticker's contract set
+    # (new listings, expired contracts dropping off). Two cadences:
+    # - Normal cadence, used outside the window below.
+    # - A faster cadence during a configurable window around market open,
+    #   specifically so same-day (0DTE) listings get picked up promptly
+    #   instead of waiting up to a full normal-cadence interval after
+    #   they first appear on the chain. TastyTrade doesn't publish an
+    #   exact same-day-listing time, so this defaults to a window starting
+    #   just before the 9:30 ET open and running past it; narrow this
+    #   window once real observation data (logged refresh diffs) shows
+    #   more precisely when new 0DTE contracts actually show up on the
+    #   chain for your tracked tickers.
+    contract_refresh_interval_s: float = Field(default=300.0, alias="CONTRACT_REFRESH_INTERVAL_S")
+    contract_refresh_fast_interval_s: float = Field(
+        default=30.0, alias="CONTRACT_REFRESH_FAST_INTERVAL_S"
+    )
+    # HH:MM, interpreted in America/New_York (handles DST automatically via
+    # zoneinfo — see service/ingestion/pipeline.py). Only applies Mon-Fri;
+    # weekends always use the normal cadence since nothing new lists then.
+    contract_refresh_fast_window_start: str = Field(
+        default="09:25", alias="CONTRACT_REFRESH_FAST_WINDOW_START"
+    )
+    contract_refresh_fast_window_end: str = Field(
+        default="10:00", alias="CONTRACT_REFRESH_FAST_WINDOW_END"
+    )
+
+    @field_validator(
+        "contract_refresh_fast_window_start", "contract_refresh_fast_window_end"
+    )
+    @classmethod
+    def _validate_hhmm(cls, v: str) -> str:
+        from datetime import time as _time
+
+        try:
+            hh, mm = v.split(":")
+            _time(int(hh), int(mm))
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"expected HH:MM (24h), got {v!r}") from e
+        return v
 
     # --- Populated from config.yaml, not env vars ---
     tickers: list[TickerConfig] = Field(default_factory=list)
+
+    # --- Logging (fixes a real bug — see service/logging_config.py) ---
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
 
 def load_config(config_path: str | Path = "config.yaml") -> AppConfig:

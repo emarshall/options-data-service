@@ -9,7 +9,7 @@ keep any single request bounded regardless of what a client asks for.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, select, text
@@ -21,12 +21,15 @@ from service.api.schemas import (
     BarsResponse,
     ContractOut,
     ContractsResponse,
+    GapOut,
+    GapsResponse,
     OptionBarOut,
     UnderlyingBarOut,
     UnderlyingBarsResponse,
 )
-from service.db.models import Contract, OptionRight
+from service.db.models import Contract, OptionRight, UnderlyingBar1m
 from service.db.session import _engine
+from service.ingestion.gap_detection import find_gaps
 from service.db.views import AGG_PERIODS, get_option_bars_table, get_underlying_bars_table
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
@@ -209,3 +212,74 @@ async def metadata(
         "date_ranges_by_ticker": date_ranges,
         "total_db_rows_estimate": total_rows
     }
+
+
+# Bounds how much a single request can scan — this endpoint does a full
+# table scan of `underlying_bars_1m` over the requested range (no index
+# shortcuts the way MIN/MAX in /metadata gets), so unlike the other
+# endpoints it needs its own explicit cap rather than relying on
+# limit/offset (there's no natural "page" of a gap report to cut off at).
+_MAX_GAP_REPORT_DAYS = 120
+
+
+@router.get("/gaps", response_model=GapsResponse)
+async def get_gaps(
+    ticker: str = Query(..., description="Underlying ticker, e.g. SPX"),
+    start: datetime = Query(..., description="Inclusive start of the time range (ISO 8601)"),
+    end: datetime = Query(..., description="Inclusive end of the time range (ISO 8601)"),
+    min_gap_minutes: int = Query(
+        1, ge=1, description="Drop gaps shorter than this many minutes (default: report all)."
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> GapsResponse:
+    """Reports missing 1-minute `underlying_bars_1m` rows for `ticker`
+    between `start` and `end` — i.e. minutes during regular trading hours
+    where a continuously-quoted underlying should have a bar but doesn't.
+
+    Deliberately underlying-only, not option contracts: an option contract
+    going quiet for stretches of time is normal (no trading activity), not
+    a gap in the data-integrity sense this endpoint checks for — see
+    `service/ingestion/gap_detection.py`'s module docstring for the full
+    reasoning, and for two caveats that apply here too: it doesn't know
+    about market holidays (a holiday shows up as a reported "gap" spanning
+    that whole session — a false positive, not a real problem), and a gap
+    older than TastyTrade's ~6-week candle retention window is real but
+    not fillable by backfill no matter what.
+
+    A separate endpoint from `/metadata` on purpose (see PLAN.md Section
+    10/this endpoint's addition) — it's a real full-range scan over
+    `underlying_bars_1m`, not a cheap MIN/MAX/COUNT, so it shouldn't run
+    as part of every `/metadata` call. `start`/`end` are capped to 120
+    days apart for the same reason (see `_MAX_GAP_REPORT_DAYS`). To
+    actually fix a reported gap, run
+    `python -m service.ingestion.backfill --reconcile-underlying-gaps`
+    (or `docker compose run --rm gap-reconcile`).
+    """
+    if start > end:
+        raise HTTPException(status_code=400, detail="start must be <= end")
+    if (end - start).days > _MAX_GAP_REPORT_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Range too wide for /gaps (max {_MAX_GAP_REPORT_DAYS} days) — query in smaller chunks.",
+        )
+
+    stmt = select(UnderlyingBar1m.time).where(
+        UnderlyingBar1m.ticker == ticker,
+        UnderlyingBar1m.time >= start,
+        UnderlyingBar1m.time <= end,
+    )
+    existing_times = {
+        t if t.tzinfo is not None else t.replace(tzinfo=timezone.utc)
+        for t in (await session.execute(stmt)).scalars().all()
+    }
+
+    gaps = find_gaps(existing_times, start, end, min_gap_minutes=min_gap_minutes)
+
+    return GapsResponse(
+        ticker=ticker,
+        start=start,
+        end=end,
+        gaps=[GapOut(start=g.start, end=g.end, minutes=g.minutes) for g in gaps],
+        gap_count=len(gaps),
+        total_missing_minutes=sum(g.minutes for g in gaps),
+    )
