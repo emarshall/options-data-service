@@ -8,4 +8,6 @@ venv/
 *.egg-info/
 .pytest_cache/
 task0_output/
+backfill_reports/
+retention_probe_output/
 .DS_Store

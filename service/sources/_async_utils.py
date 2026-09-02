@@ -109,6 +109,10 @@ async def collect_events(
     cancel_grace_s: float = 2.0,
     event_filter: Callable[[Any], bool] | None = None,
     idle_timeout_s: float | None = None,
+    stop_on_repeated_key: bool = False,
+    event_key: Callable[[Any], Any | None] | None = None,
+    repeat_key_min_value: Any | None = None,
+    diagnostics: dict | None = None,
 ) -> list[Any]:
     """Drain an async event generator for up to timeout_s seconds, or until
     max_count events are collected, whichever comes first. See module
@@ -121,9 +125,7 @@ async def collect_events(
     stream that never naturally ends (e.g. `Candle` events for the
     in-progress bar keep streaming indefinitely) — without it, every call
     unconditionally takes the full `timeout_s`, even once all the actual
-    data of interest arrived in the first second or two. This was found
-    to be a real, significant performance problem (not a hang) running
-    the backfill job against real data — see PLAN.md Section 7.
+    data of interest arrived in the first second or two.
 
     The idle clock only resets on events that pass `event_filter` (i.e.
     ones actually kept) — an unrelated event arriving on the same channel
@@ -132,42 +134,109 @@ async def collect_events(
     event, not by naively re-arming a fresh `idle_timeout_s` window on
     every raw event regardless of whether it passed the filter.
 
+    `stop_on_repeated_key`/`event_key`, if both given, add a THIRD
+    stopping condition -- added after a real, *directly observed* problem
+    (raw DEBUG logs of an actual TastyTrade connection -- see PLAN.md
+    Section 7): once a `Candle` historical replay finishes, the
+    subscription doesn't just quietly stop -- it keeps delivering the
+    *current, in-progress* candle over and over as new ticks arrive within
+    that same minute (the same `time` value repeated, with an incrementing
+    `count` field each time), indefinitely, roughly every 10-20 seconds.
+    That live tail has no natural end and arrives faster than any
+    reasonable `idle_timeout_s`, so idle-timeout alone can never
+    distinguish "still receiving real historical data" from "done, now
+    just watching the current candle update in place." `event_key(ev)`
+    extracts a comparable value from each *kept* event (its own `time`
+    field, for Candles); the first time the *same* key is seen twice,
+    collection stops.
+
+    **`repeat_key_min_value`, if given, gates that stop** -- a repeated
+    key only ends collection if the key itself is
+    `>= repeat_key_min_value`; a repeat of an *older* key is recorded (so
+    a later repeat of the same key won't re-trigger anything) but
+    collection continues. Added after finding, from real report data (see
+    PLAN.md Section 7), that the unconditional version above was firing
+    too early: a large historical replay apparently isn't always
+    delivered as a single clean run from old to new -- at least once, a
+    request that should have covered ~6 weeks of history stopped after
+    receiving real data for only the most recent ~20 days, because
+    *something* in the older portion of the stream repeated a key before
+    the genuinely-final live-tail repeat ever arrived. Gating on recency
+    (the caller typically passes something like "within the last few
+    minutes of wall-clock now") means only a repeat of what's actually
+    plausibly the live, in-progress candle can end the collection -- a
+    repeat of an old, already-closed historical candle no longer
+    short-circuits anything, which is exactly the failure this was built
+    to prevent. Without this parameter (the default), behavior is
+    unchanged from the original, unconditional version -- this is an
+    additive safety refinement, not a replacement.
+
+    `diagnostics`, if given a dict, gets populated (in place) with
+    `stop_reason` (one of `"max_count"`, `"outer_timeout"`,
+    `"idle_timeout"`, `"repeated_key"`, `"stream_ended"`), `elapsed_s`,
+    and `event_count` -- added specifically so callers troubleshooting a
+    slow or incomplete result (e.g. `request_candles`, and in turn
+    `BackfillJob`'s diagnostic report -- see PLAN.md Section 7) can report
+    *which* stopping condition actually ended a given call without having
+    to infer it from indirect evidence the way every earlier round of this
+    investigation had to.
+
     Safe to let a per-item wait_for time out and effectively abandon
-    `listen_iter` afterward (rather than trying to keep it usable) — every
+    `listen_iter` afterward (rather than trying to keep it usable) -- every
     caller of this function creates a fresh `streamer.listen(...)`
     generator per call and never reuses one across multiple
     collect_events() invocations.
     """
     events: list[Any] = []
+    stop_reason = "stream_ended"
+    start_wall = asyncio.get_event_loop().time()
 
     async def _drain():
+        nonlocal stop_reason
         loop = asyncio.get_event_loop()
         idle_deadline = loop.time() + idle_timeout_s if idle_timeout_s is not None else None
+        seen_keys: set[Any] = set()
         while True:
             try:
                 if idle_deadline is not None:
                     remaining = idle_deadline - loop.time()
                     if remaining <= 0:
+                        stop_reason = "idle_timeout"
                         return
                     ev = await asyncio.wait_for(listen_iter.__anext__(), timeout=remaining)
                 else:
                     ev = await listen_iter.__anext__()
             except StopAsyncIteration:
+                stop_reason = "stream_ended"
                 return
             except asyncio.TimeoutError:
-                return  # gone idle for idle_timeout_s — nothing new coming soon, stop early
+                stop_reason = "idle_timeout"
+                return  # gone idle for idle_timeout_s -- nothing new coming soon, stop early
             if event_filter is not None and not event_filter(ev):
-                continue  # doesn't count as activity — idle_deadline is untouched
+                continue  # doesn't count as activity -- idle_deadline is untouched
             events.append(ev)
             if idle_timeout_s is not None:
                 idle_deadline = loop.time() + idle_timeout_s  # reset only on a kept event
+            if stop_on_repeated_key and event_key is not None:
+                k = event_key(ev)
+                if k is not None:
+                    if k in seen_keys:
+                        if repeat_key_min_value is None or k >= repeat_key_min_value:
+                            stop_reason = "repeated_key"
+                            return  # this key was already reported once and looks recent enough
+                        # else: a repeat of an old, already-closed key -- not the live tail,
+                        # just an ordinary duplicate; keep going.
+                    seen_keys.add(k)
             if max_count is not None and len(events) >= max_count:
+                stop_reason = "max_count"
                 return
+
 
     task = asyncio.ensure_future(_drain())
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
     except asyncio.TimeoutError:
+        stop_reason = "outer_timeout"
         task.cancel()
         try:
             await asyncio.wait_for(task, timeout=cancel_grace_s)
@@ -184,6 +253,12 @@ async def collect_events(
         pass  # e.g. shield itself got cancelled from further up
     except Exception:
         pass
+
+    if diagnostics is not None:
+        diagnostics["stop_reason"] = stop_reason
+        diagnostics["elapsed_s"] = round(asyncio.get_event_loop().time() - start_wall, 2)
+        diagnostics["event_count"] = len(events)
+
     return events
 
 

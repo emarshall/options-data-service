@@ -105,14 +105,23 @@ services:
   # `docker compose up` (see `profiles` below) since it's a one-off/
   # periodic job, not a continuously-running service — run it explicitly:
   #   docker compose run --rm backfill
+  # On-demand: incremental by default (resumes from each contract/ticker's
+  # latest existing bar — see PLAN.md Section 7) — use `--full` for an
+  # occasional deep re-scan. `--report` writes a diagnostic summary (per-
+  # underlying request timing/stop-reason, any option contract that failed
+  # or hit a truncation warning) to ./backfill_reports/ on the host — see
+  # PLAN.md Section 7 for why this exists (troubleshooting used to require
+  # pasting a huge raw console log). Check ./backfill_reports/*.md after a
+  # run.
   backfill:
     build: .
-    command: python -m service.ingestion.backfill
+    command: python -m service.ingestion.backfill --report
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+      - ./backfill_reports:/app/backfill_reports
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -155,15 +164,17 @@ services:
   # see Task 11 in PLAN.md, deliberately deferred), e.g.:
   #   0 6 * * * cd /path/to/options-service && docker compose run --rm gap-reconcile
   # Check what it found/fixed via `GET /gaps` (service/api/routes.py) or
-  # this container's own logs.
+  # ./backfill_reports/*.md on the host (see the `backfill` service's own
+  # comment above — same --report mechanism, same mount).
   gap-reconcile:
     build: .
-    command: python -m service.ingestion.backfill --reconcile-underlying-gaps
+    command: python -m service.ingestion.backfill --reconcile-underlying-gaps --report
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+      - ./backfill_reports:/app/backfill_reports
     depends_on:
       timescaledb:
         condition: service_healthy

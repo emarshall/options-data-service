@@ -15,9 +15,10 @@ import signal
 from service.config.settings import get_settings
 from service.db.session import check_connection, get_session_factory
 from service.ingestion.pipeline import IngestionPipeline
+from service.logging_config import configure_logging
 from service.sources.tastytrade import TastyTradeSource
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+configure_logging("ingestion", get_settings().log_level)
 log = logging.getLogger("ingestion")
 
 

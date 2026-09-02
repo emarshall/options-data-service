@@ -406,3 +406,181 @@ async def test_api_key_required_when_configured(client, monkeypatch):
     finally:
         monkeypatch.delenv("API_KEY", raising=False)
         get_settings.cache_clear()
+
+
+# --- GET /gaps ---
+
+
+@pytest.mark.asyncio
+async def test_get_gaps_reports_none_for_fully_covered_range(client, db_session_factory):
+    from service.ingestion.gap_detection import expected_bar_minutes
+
+    start = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 22, 23, 59, tzinfo=timezone.utc)
+    minutes = expected_bar_minutes(start, end)
+
+    async with db_session_factory() as session:
+        for m in minutes:
+            session.add(UnderlyingBar1m(time=m, ticker="SPX", open=1, high=1, low=1, close=1))
+        await session.commit()
+
+    resp = await client.get(
+        "/gaps", params={"ticker": "SPX", "start": start.isoformat(), "end": end.isoformat()}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ticker"] == "SPX"
+    assert body["gap_count"] == 0
+    assert body["gaps"] == []
+    assert body["total_missing_minutes"] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_gaps_reports_a_missing_range(client, db_session_factory):
+    from service.ingestion.gap_detection import expected_bar_minutes
+
+    # 9a-11a present, nothing again until 12p — the exact bug-report scenario.
+    start = datetime(2026, 7, 22, 9, 30, tzinfo=timezone.utc).astimezone(timezone.utc)
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    session_start = datetime(2026, 7, 22, 9, 30, tzinfo=et).astimezone(timezone.utc)
+    session_end = datetime(2026, 7, 22, 16, 0, tzinfo=et).astimezone(timezone.utc)
+    morning_cutoff = datetime(2026, 7, 22, 11, 0, tzinfo=et).astimezone(timezone.utc)
+    afternoon_start = datetime(2026, 7, 22, 12, 0, tzinfo=et).astimezone(timezone.utc)
+
+    minutes = expected_bar_minutes(session_start, session_end)
+
+    async with db_session_factory() as session:
+        for m in minutes:
+            if m <= morning_cutoff or m >= afternoon_start:
+                session.add(UnderlyingBar1m(time=m, ticker="SPX", open=1, high=1, low=1, close=1))
+        await session.commit()
+
+    resp = await client.get(
+        "/gaps",
+        params={
+            "ticker": "SPX",
+            "start": session_start.isoformat(),
+            "end": session_end.isoformat(),
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["gap_count"] == 1
+    assert body["total_missing_minutes"] == 59
+    assert body["gaps"][0]["minutes"] == 59
+
+
+@pytest.mark.asyncio
+async def test_get_gaps_does_not_report_data_for_a_different_ticker(client, db_session_factory):
+    from service.ingestion.gap_detection import expected_bar_minutes
+
+    start = datetime(2026, 7, 22, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 7, 22, 23, 59, tzinfo=timezone.utc)
+    minutes = expected_bar_minutes(start, end)
+
+    async with db_session_factory() as session:
+        for m in minutes:
+            session.add(UnderlyingBar1m(time=m, ticker="NDX", open=1, high=1, low=1, close=1))
+        await session.commit()
+
+    resp = await client.get(
+        "/gaps", params={"ticker": "SPX", "start": start.isoformat(), "end": end.isoformat()}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["gap_count"] == 1  # SPX has NDX's bars, so nothing at all counts as "existing" for SPX
+
+
+@pytest.mark.asyncio
+async def test_get_gaps_start_after_end_returns_400(client):
+    resp = await client.get(
+        "/gaps",
+        params={
+            "ticker": "SPX",
+            "start": "2026-07-22T12:00:00Z",
+            "end": "2026-07-22T09:00:00Z",
+        },
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_get_gaps_range_too_wide_returns_400(client):
+    resp = await client.get(
+        "/gaps",
+        params={
+            "ticker": "SPX",
+            "start": "2026-01-01T00:00:00Z",
+            "end": "2026-12-31T00:00:00Z",
+        },
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_get_gaps_flags_a_gap_entirely_before_retention(client, db_session_factory):
+    from service.ingestion.gap_detection import RETENTION_DAYS
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=RETENTION_DAYS + 30)
+    end = now - timedelta(days=RETENTION_DAYS + 10)  # entirely before the retention cutoff
+
+    resp = await client.get(
+        "/gaps", params={"ticker": "SPX", "start": start.isoformat(), "end": end.isoformat()}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["gap_count"] >= 1
+    assert all(g["before_retention"] for g in body["gaps"])
+
+
+@pytest.mark.asyncio
+async def test_get_gaps_reports_retention_cutoff(client):
+    resp = await client.get(
+        "/gaps",
+        params={
+            "ticker": "SPX",
+            "start": "2026-07-22T00:00:00Z",
+            "end": "2026-07-22T23:59:00Z",
+        },
+    )
+    assert resp.status_code == 200
+    assert "retention_cutoff" in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_get_gaps_respects_min_gap_minutes(client, db_session_factory):
+    from zoneinfo import ZoneInfo
+
+    from service.ingestion.gap_detection import expected_bar_minutes
+
+    et = ZoneInfo("America/New_York")
+    start = datetime(2026, 7, 22, 9, 30, tzinfo=et).astimezone(timezone.utc)
+    end = datetime(2026, 7, 22, 9, 40, tzinfo=et).astimezone(timezone.utc)
+    minutes = expected_bar_minutes(start, end)
+
+    async with db_session_factory() as session:
+        for m in minutes:
+            if m != minutes[5]:  # one missing minute
+                session.add(UnderlyingBar1m(time=m, ticker="SPX", open=1, high=1, low=1, close=1))
+        await session.commit()
+
+    resp_default = await client.get(
+        "/gaps", params={"ticker": "SPX", "start": start.isoformat(), "end": end.isoformat()}
+    )
+    resp_filtered = await client.get(
+        "/gaps",
+        params={
+            "ticker": "SPX", "start": start.isoformat(), "end": end.isoformat(),
+            "min_gap_minutes": 2,
+        },
+    )
+
+    assert resp_default.json()["gap_count"] == 1
+    assert resp_filtered.json()["gap_count"] == 0

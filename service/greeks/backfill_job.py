@@ -152,7 +152,10 @@ class GreeksBackfillJob:
 
 
 async def _main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from service.config.settings import get_settings as _get_settings
+    from service.logging_config import configure_logging
+
+    configure_logging("service.greeks.backfill_job", _get_settings().log_level)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--max-rows", type=int, default=None,

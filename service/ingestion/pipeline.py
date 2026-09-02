@@ -1,8 +1,8 @@
 """
 Live ingestion pipeline: wires TastyTradeSource + ContractManager +
 BarAggregator together into the actual "stream market data -> aggregate
-into 1m bars -> write to DB" loop. This is what service/ingestion/main.py
-(a placeholder since Task 1) becomes for real.
+into 1m bars -> write to DB" loop. service/ingestion/main.py runs this for
+real.
 
 **Design note — a real interaction with Task 2's "one callback per event
 type" rule, discovered while building this:** options and the underlying
@@ -23,13 +23,27 @@ Candle events (Task 5's backfill). Bars written by this pipeline will have
 those columns NULL; only backfilled bars populate them. Revisit only if
 that turns out to matter (e.g. by also subscribing to Trade events, not
 currently in scope).
+
+**Contract refresh scheduling (Task 9):** the refresh loop uses two
+cadences, not one fixed interval — a faster one during a configurable
+window around market open (`settings.contract_refresh_fast_window_start`/
+`_end`, America/New_York, Mon-Fri only), and the normal cadence otherwise.
+This is what gets a same-day (0DTE) listing subscribed to promptly instead
+of waiting up to a full normal-cadence interval after it first appears on
+the chain, without needing to poll the fast cadence all day. AM-settlement
+exclusion itself needed no new work here — `ContractManager` already
+filters using `settlement_type` sourced from the instruments-API option
+chain (`get_option_chain()`), not any DXLink streaming event, which is
+exactly what Task 9 called for; see `contract_manager.py`'s module
+docstring.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 
 from service.config.settings import AppConfig
 from service.db.models import GreeksSource, OptionBar1m, UnderlyingBar1m
@@ -42,12 +56,15 @@ log = logging.getLogger(__name__)
 
 
 class IngestionPipeline:
+    _MARKET_TZ = ZoneInfo("America/New_York")
+
     def __init__(
         self,
         source: MarketDataSource,
         session_factory,
         settings: AppConfig,
-        contract_refresh_interval_s: float = 300.0,
+        contract_refresh_interval_s: float | None = None,
+        contract_refresh_fast_interval_s: float | None = None,
         flush_interval_s: float = 5.0,
         clock=lambda: datetime.now(timezone.utc),
     ):
@@ -57,7 +74,21 @@ class IngestionPipeline:
         self._contract_manager = ContractManager(source, session_factory, settings.tickers)
         self._option_bars = BarAggregator()
         self._underlying_bars = BarAggregator()
-        self._contract_refresh_interval_s = contract_refresh_interval_s
+        # Explicit constructor args win (mainly for tests); otherwise pull
+        # from settings, which is where real config (env-var overridable)
+        # lives as of Task 9 — see settings.py for defaults/rationale.
+        self._contract_refresh_interval_s = (
+            contract_refresh_interval_s
+            if contract_refresh_interval_s is not None
+            else settings.contract_refresh_interval_s
+        )
+        self._contract_refresh_fast_interval_s = (
+            contract_refresh_fast_interval_s
+            if contract_refresh_fast_interval_s is not None
+            else settings.contract_refresh_fast_interval_s
+        )
+        self._fast_window_start = self._parse_hhmm(settings.contract_refresh_fast_window_start)
+        self._fast_window_end = self._parse_hhmm(settings.contract_refresh_fast_window_end)
         self._flush_interval_s = flush_interval_s
         self._underlying_tickers: set[str] = {
             t.ticker for t in settings.tickers if t.capture_underlying_bars
@@ -66,6 +97,22 @@ class IngestionPipeline:
         # Injectable so tests can control bucket timing deterministically
         # instead of needing to sleep real wall-clock seconds.
         self._clock = clock
+
+    @staticmethod
+    def _parse_hhmm(value: str) -> time:
+        hh, mm = value.split(":")
+        return time(int(hh), int(mm))
+
+    def _current_refresh_interval_s(self) -> float:
+        """Fast cadence during the configured pre/post-open window on a
+        weekday, normal cadence otherwise (including all weekends — see
+        module docstring)."""
+        now_et = self._clock().astimezone(self._MARKET_TZ)
+        if now_et.weekday() >= 5:  # Saturday=5, Sunday=6
+            return self._contract_refresh_interval_s
+        if self._fast_window_start <= now_et.time() <= self._fast_window_end:
+            return self._contract_refresh_fast_interval_s
+        return self._contract_refresh_interval_s
 
     async def run(self) -> None:
         """Runs forever (until close()): initial contract resolution +
@@ -91,7 +138,8 @@ class IngestionPipeline:
 
     async def _refresh_loop(self) -> None:
         while not self._closed:
-            await asyncio.sleep(self._contract_refresh_interval_s)
+            interval = self._current_refresh_interval_s()
+            await asyncio.sleep(interval)
             if self._closed:
                 return
             try:
@@ -141,6 +189,22 @@ class IngestionPipeline:
                         greeks_source=GreeksSource.LIVE if bucket.has_greeks else None,
                     )
                 )
+                # DEBUG, not INFO — intentionally opt-in (LOG_LEVEL=DEBUG), one
+                # line per bar with just the fields useful for spot-checking
+                # ingestion (contract identity, delta, price), not the raw
+                # event payload. See PLAN.md Section 7 for the *actual* source
+                # of the "way too much logging" problem this was originally
+                # meant to address — it wasn't application-level logging at
+                # all, it was the `tastytrade` package's own internal debug
+                # logging of every raw websocket message, now silenced in
+                # service/logging_config.py. This per-bar line is a genuinely
+                # useful opt-in on top of that fix, not a replacement for it.
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug(
+                        "bar %s %s %s exp=%s strike=%s delta=%s close=%s",
+                        resolved.underlying_ticker, contract_id, resolved.right,
+                        resolved.expiration_date, resolved.strike, bucket.delta, bucket.close,
+                    )
             for ticker, minute, bucket in underlying_ready:
                 session.add(
                     UnderlyingBar1m(

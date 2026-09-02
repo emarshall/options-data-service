@@ -161,11 +161,74 @@ alerting, deliberately deferred as lowest-priority/optional). The recommended wa
 0 6 * * * cd /path/to/options-service && docker compose run --rm gap-reconcile
 ```
 
-**Neither can recover data older than TastyTrade's ~6-week candle retention window** (Task 0's
-confirmed finding) — a gap that old is real and will keep showing up in `/gaps`, but no amount of
-backfilling brings back data the feed itself no longer has. `/gaps`'s own response doesn't try to guess
-which of its reported gaps fall in this bucket; if a gap's `start` is much older than ~6 weeks ago,
-that's the likely explanation for why reconciling doesn't clear it.
+### Diagnostic reports
+
+Both `backfill` and `gap-reconcile` (via `docker compose run`, above) now write a diagnostic report by
+default — `./backfill_reports/<kind>_<timestamp>.md` (human-readable) and `.json` (full detail) on the
+host, via a mounted volume. Built specifically so troubleshooting a slow or incomplete run doesn't require
+pasting a huge raw console log (see PLAN.md Section 7 for the investigation that made clear a structured
+summary was needed) — the `.md` file has per-underlying request diagnostics (how the request actually
+ended — caught up to live, hit a timeout, hit max_count — how long it took, and the earliest/latest candle
+actually received) plus any option contract that failed or hit a truncation warning. Successful,
+unremarkable option contracts aren't listed individually (with a few hundred tracked, that would just
+become the next "too much output" problem) — the aggregate counts in the summary cover those.
+
+Running directly (not via `docker compose run`) works the same way — `--report` with no argument
+auto-generates a timestamped path, or give it an explicit one:
+```bash
+python -m service.ingestion.backfill --reconcile-underlying-gaps --report
+python -m service.ingestion.backfill --report /tmp/my-run
+```
+
+**Underlying candle retention is shorter than option-contract retention, and count-based rather than
+date-based — confirmed directly from real per-day density data, not assumed.** A `gap-reconcile` report's
+`candles_per_day` breakdown showed a sharp cliff (near-zero straight to several hundred/day) at a
+*different* calendar date for each of three tickers tested — roughly 27 days back for SPX, 23 for NDX, 14
+for VIX — with nothing but a single boundary-marker event before that cliff. Multiplying each ticker's
+dense-window length by its own per-day candle rate landed all three within ~7650-7950 total candles
+retained, despite very different calendar windows and per-day volumes (VIX runs ~2x SPX's daily rate) —
+strong evidence of a roughly fixed *count* of trailing candles kept per symbol, not a fixed number of
+days. `RETENTION_DAYS` (`service/ingestion/gap_detection.py`) is set to `14` — the shortest observed
+window (VIX), conservatively, since this codebase only models a single day-count constant and a
+higher-frequency symbol added later could plausibly have an even shorter effective window.
+
+**Practical result: gaps older than `RETENTION_DAYS` are not a bug and cannot be fixed by this codebase**
+— that data no longer exists upstream, and no amount of client-side timeout/retry tuning changes that
+(several real client-side bugs *were* found and fixed along the way to reaching this conclusion — see
+PLAN.md Section 7 for the full investigation — this final measurement is what let them be told apart from
+the underlying retention limit itself). `/gaps`'s `retention_cutoff` field and each gap's
+`before_retention` flag reflect this; a gap flagged `before_retention: true` is expected to never clear.
+
+**If a gap within the retention window still isn't closing:** check the diagnostic report's
+`candles_per_day` breakdown for that ticker directly — a real, dense day-by-day count is the most direct
+evidence available, more so than `stop_reason` or `bars_written` alone (both of which were misleading at
+different points during this investigation). See PLAN.md Section 7 for what each of the report's fields
+means and the specific failure modes they were each added to catch.
+
+**A full `backfill` run taking a long time against many option contracts (not underlyings) is a
+different, more ordinary scale problem, and has an actual mitigation:** contracts are now processed
+concurrently (`--concurrency`, default 8) instead of strictly one at a time — see `docker compose run
+--rm backfill --concurrency 16` (or higher) if a run against many tracked contracts is still slow and the
+bottleneck doesn't look like the TastyTrade connection itself. Progress is logged every 25 contracts so a
+long run doesn't look stuck.
+
+**If a gap is entirely (or partly) older than ~6 weeks, it will never clear, and that's expected —**
+`GET /gaps`'s response includes a `retention_cutoff` field and each gap's own `before_retention` flag for
+exactly this reason. `gap-reconcile` won't even try to scan or "fix" anything older than that cutoff
+(it silently raises its scan window to the cutoff instead — check `requested_start_before_retention` in
+its logged result if you're not sure whether that happened on a given run); trying repeatedly won't help
+for a gap that old, since the underlying data simply no longer exists on the feed.
+
+**If backfill/gap-reconcile still won't recover data that should be within ~6 weeks:** run
+```bash
+python -m scripts.underlying_retention_probe --ticker NDX
+```
+against the real TastyTrade feed to measure the actual retention wall empirically (see the script's own
+docstring). If it finds a different number than `RETENTION_DAYS` in `service/ingestion/gap_detection.py`,
+update that constant — everything downstream (the truncation warnings, `reconcile_underlying_gaps`'s scan
+clipping, `/gaps`'s `before_retention` flag) already keys off it, so that's the whole fix. Each lookback
+window this probe tests should now run quickly (see PLAN.md Section 7 — a real ~15-minute-per-request bug
+was found and fixed this way, unrelated to retention itself).
 
 ## Running tests
 
@@ -227,7 +290,10 @@ python -m scripts.task2_smoke_test --ticker SPY
   make every run take 15-30 minutes regardless of whether there was anything new; see PLAN.md Section 7
   for the bug writeup). Pass `--full` to force the old always-full-lookback behavior for an occasional
   deep re-verify. Neither mode looks for gaps *earlier* than a contract/ticker's latest bar — that's what
-  `gap-reconcile` is for (see "Finding and fixing gaps" above).
+  `gap-reconcile` is for (see "Finding and fixing gaps" above). Option contracts are backfilled
+  concurrently (`--concurrency`, default 8) — raise it for a run against many tracked contracts if that's
+  still the bottleneck. Underlying backfill/reconciliation, separately, is still just slow (~15 min per
+  ticker) — see "Underlying backfill/reconciliation is genuinely slow" below.
 - **Log volume:** if you're seeing (or saw, on an earlier version) an overwhelming amount of log output
   from `ingestion`/`backfill`, that was a real bug, not expected behavior — the `tastytrade` package sets
   its own internal logger to DEBUG on import, independent of this app's own logging config, and logs the
@@ -284,7 +350,8 @@ service/
   sources/     — MarketDataSource interface + TastyTradeSource (auth, chain lookup, streaming, candles)
   ingestion/   — ContractManager (contract resolution/refresh), IngestionPipeline + BarAggregator
                  (live streaming -> 1m bars), BackfillJob (historical candles, incremental by default,
-                 plus underlying gap detection/reconciliation), gap_detection.py (missing-minute scanning)
+                 concurrent option-contract backfill, underlying gap detection/reconciliation, diagnostic
+                 reports — see --report), gap_detection.py (missing-minute scanning, RETENTION_DAYS)
   greeks/      — Black-Scholes calculator + GreeksBackfillJob (fills in Greeks for backfilled rows)
   api/         — FastAPI query app: /options/bars, /underlying/bars, /contracts, /metadata, /gaps, /health
   db/          — SQLAlchemy models, session management, continuous-aggregate view definitions
@@ -292,7 +359,9 @@ service/
   logging_config.py — shared logging setup; silences a real log-flood bug in the `tastytrade` dependency
 alembic/       — DB migrations, including the Task 7 continuous aggregates
 scripts/       — one-off utility scripts: task0_spike/ (TastyTrade credential setup + the candle-depth
-                 feasibility spike) and taskN_smoke_test.py (real-credentials smoke tests per task)
+                 feasibility spike) and taskN_smoke_test.py (real-credentials smoke tests per task);
+                 underlying_retention_probe.py (measures actual underlying candle retention — see
+                 PLAN.md Section 7 for why this exists)
 docker-compose.yml
 Dockerfile
 PLAN.md        — the full project plan, rationale, and per-task implementation log; read this for detail

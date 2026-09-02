@@ -262,3 +262,109 @@ async def test_removed_contract_gets_unsubscribed(db_session_factory, clock):
     await pipeline._refresh_and_subscribe()
 
     assert "SPY_C450" in source.unsubscribed
+
+
+# --- Task 9: adaptive contract-refresh cadence (fast near market open) ---
+
+
+class FakeUtcClock:
+    """A clock fixed to a specific instant, given as naive
+    America/New_York wall-clock time — for cadence tests, expressing the
+    fixture in ET is much easier to reason about than UTC + DST offset."""
+
+    def __init__(self, year, month, day, hour, minute):
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+
+        self._now = _dt(year, month, day, hour, minute, tzinfo=ZoneInfo("America/New_York")).astimezone(
+            timezone.utc
+        )
+
+    def __call__(self) -> datetime:
+        return self._now
+
+
+def _pipeline_for_cadence(clock, **settings_overrides):
+    settings = _settings()
+    for k, v in settings_overrides.items():
+        setattr(settings, k, v)
+    return IngestionPipeline(FakeSourceStub(), None, settings, clock=clock)
+
+
+class FakeSourceStub:
+    """IngestionPipeline's constructor only needs *something* to hand to
+    ContractManager — cadence tests never actually call refresh/subscribe,
+    so no methods need to be implemented here."""
+
+
+@pytest.mark.parametrize(
+    "when,expected",
+    [
+        # Wed 9:15 ET — before the fast window starts.
+        ((2026, 7, 22, 9, 15), "normal"),
+        # Wed 9:25 ET — right at the fast window's start (inclusive).
+        ((2026, 7, 22, 9, 25), "fast"),
+        # Wed 9:30 ET — market open, well inside the window.
+        ((2026, 7, 22, 9, 30), "fast"),
+        # Wed 10:00 ET — right at the fast window's end (inclusive).
+        ((2026, 7, 22, 10, 0), "fast"),
+        # Wed 10:01 ET — just past the window.
+        ((2026, 7, 22, 10, 1), "normal"),
+        # Wed 14:00 ET — mid-day, well outside the window.
+        ((2026, 7, 22, 14, 0), "normal"),
+        # Saturday 9:30 ET — inside the time-of-day window, but a weekend,
+        # so nothing lists and it should never use the fast cadence.
+        ((2026, 7, 25, 9, 30), "normal"),
+        # Sunday 9:30 ET — same reasoning.
+        ((2026, 7, 26, 9, 30), "normal"),
+    ],
+)
+def test_refresh_cadence_switches_on_market_open_window(when, expected):
+    clock = FakeUtcClock(*when)
+    pipeline = _pipeline_for_cadence(clock)
+
+    interval = pipeline._current_refresh_interval_s()
+
+    if expected == "fast":
+        assert interval == pipeline._contract_refresh_fast_interval_s
+    else:
+        assert interval == pipeline._contract_refresh_interval_s
+    # Sanity: the two cadences are actually configured differently, or this
+    # test would pass trivially regardless of which branch is taken.
+    assert pipeline._contract_refresh_fast_interval_s != pipeline._contract_refresh_interval_s
+
+
+def test_refresh_cadence_respects_custom_window_and_intervals():
+    """Not just the defaults — a narrower, later window and different
+    interval values should be honored too."""
+    settings = _settings()
+    settings.contract_refresh_interval_s = 120.0
+    settings.contract_refresh_fast_interval_s = 15.0
+    settings.contract_refresh_fast_window_start = "15:55"
+    settings.contract_refresh_fast_window_end = "16:05"
+
+    pipeline = IngestionPipeline(
+        FakeSourceStub(), None, settings, clock=FakeUtcClock(2026, 7, 22, 16, 0)
+    )
+    assert pipeline._current_refresh_interval_s() == 15.0
+
+    pipeline_outside = IngestionPipeline(
+        FakeSourceStub(), None, settings, clock=FakeUtcClock(2026, 7, 22, 12, 0)
+    )
+    assert pipeline_outside._current_refresh_interval_s() == 120.0
+
+
+def test_explicit_constructor_args_override_settings():
+    """Tests (and any future caller) should still be able to force a
+    specific cadence directly, bypassing settings entirely."""
+    settings = _settings()
+    pipeline = IngestionPipeline(
+        FakeSourceStub(),
+        None,
+        settings,
+        contract_refresh_interval_s=999.0,
+        contract_refresh_fast_interval_s=1.0,
+        clock=FakeUtcClock(2026, 7, 22, 14, 0),
+    )
+    assert pipeline._contract_refresh_interval_s == 999.0
+    assert pipeline._contract_refresh_fast_interval_s == 1.0

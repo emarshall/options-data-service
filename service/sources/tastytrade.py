@@ -35,13 +35,30 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from service.sources._async_utils import chunked, collect_events, get_attr_any, with_timeout
 from service.sources.base import MarketDataSource
 
 log = logging.getLogger(__name__)
+
+
+def _candle_event_time(ev: Any) -> datetime | None:
+    """Extracts a Candle event's own `time` (ms since epoch) as a UTC
+    datetime. Currently unused by `request_candles` itself — it was
+    written for a "stop once caught up to live" optimization that was
+    added and then reverted after causing a real regression (see
+    PLAN.md Section 7, and `request_candles`'s own docstring for the full
+    story: that optimization assumed oldest-first delivery order, which
+    isn't confirmed and looks likely wrong). Left in place, small and
+    independently tested, in case delivery order gets confirmed later and
+    a corrected version of that optimization becomes worth re-adding."""
+    ms = get_attr_any(ev, "time")
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
 
 # Capped exponential-ish backoff schedule for reconnect attempts (seconds).
 # Repeats the last value indefinitely if more retries are needed — this is
@@ -323,12 +340,22 @@ class TastyTradeSource(MarketDataSource):
 
     async def request_candles(
         self, symbol: str, period: str, start_time: datetime,
-        timeout_s: float = 240.0, max_count: int = 100_000,
+        timeout_s: float = 240.0, max_count: int = 100_000, idle_timeout_s: float = 3.0,
+        diagnostics: dict | None = None,
     ) -> list[Any]:
         """One-off historical candle pull. Per Task 0 findings: 1-minute
         option candle depth is capped at ~6 weeks regardless of how far
         back `start_time` requests, but requesting further back than that
         is harmless (just returns whatever's actually available).
+
+        `diagnostics`, if given a dict, gets populated with everything
+        needed to troubleshoot a slow/incomplete result without needing
+        the raw candle list or verbose logs — `stop_reason`, `elapsed_s`,
+        `event_count` (from `collect_events`), plus request context
+        (`symbol`, `requested_start`, the effective `timeout_s`/
+        `idle_timeout_s`/`max_count`) and result shape (`earliest_candle`,
+        `latest_candle`, `hit_max_count`). Built for `BackfillJob`'s
+        diagnostic report — see PLAN.md Section 7.
 
         **`timeout_s`/`max_count` bug fix (found investigating Task 9's
         underlying-backfill issue — see PLAN.md Section 7):** the original
@@ -344,14 +371,95 @@ class TastyTradeSource(MarketDataSource):
         with no error — indistinguishable from "that's just all the data
         there is" from the caller's side. Both bumped well above any
         realistic single-symbol candle count for the lookback windows this
-        service actually uses (`idle_timeout_s` below is still what ends a
-        typical, sparse, option-contract call quickly — these are just the
-        safety-net ceiling for the dense case, not the common-case
-        stopping condition).
+        service actually uses.
+
+        **`idle_timeout_s` is also caller-tunable now, for the same
+        underlying reason (found investigating a follow-up report: gap
+        reconciliation over a multi-week span for a dense underlying still
+        wasn't recovering all of it, even after the fix above).**
+        `collect_events`'s idle-timeout mechanism stops the collection as
+        soon as no new *matching* event has arrived for `idle_timeout_s`
+        seconds — a good, important optimization for a typically-sparse
+        option contract (see that function's docstring), but a real risk
+        for a large historical replay: a multi-week pull for a
+        continuously-quoted underlying is tens of thousands of events, and
+        it's plausible the server delivers that in internally-batched
+        bursts with an occasional pause between them exceeding a few
+        seconds — which this function would previously (fixed 3.0s idle
+        timeout) misread as "no more data," ending the collection early
+        with a *partial* result and no error, functionally identical to
+        the original bug this same investigation already fixed once.
+
+        **Confirmed against a real connection** (via
+        `scripts/underlying_retention_probe.py` — see PLAN.md Section 7):
+        for a continuously-quoted underlying, the *entire* historical
+        replay is apparently delivered slowly/throttled — individual
+        events keep trickling in with gaps well under `idle_timeout_s`
+        the whole time, so `idle_timeout_s` never actually triggers, and
+        every single call was running for the *full* `timeout_s` — ~15
+        real minutes at the values that investigation used — regardless
+        of how much history was actually being asked for.
+
+        **A "stop once caught up to live" third stopping condition was
+        added here to fix that slowness, then REVERTED after it caused a
+        real regression** (see PLAN.md Section 7) — it compared each
+        event's own timestamp against wall-clock "now," which rests on an
+        assumption about delivery *order* that was never actually
+        confirmed and looked likely wrong given how it failed.
+
+        **Root cause actually found, from raw DEBUG logs of a real
+        connection (see PLAN.md Section 7):** the "trickle" isn't the
+        historical replay running slowly — it's that once the replay
+        finishes, the subscription doesn't stop; it keeps re-delivering
+        the *current, in-progress* candle over and over as new ticks
+        arrive within that same minute (same `time` value, incrementing
+        `count` field), indefinitely, roughly every 10-20 seconds. That
+        live tail has no natural end and arrives faster than any
+        reasonable `idle_timeout_s`, so idle-timeout alone can never tell
+        "still receiving real history" apart from "done, now just
+        watching the current candle update in place." **Fix: a third
+        stopping condition, `stop_on_repeated_key`, keyed on each candle's
+        own `time` field** — a genuinely historical, closed candle is only
+        ever reported once; only the live/in-progress one gets re-sent, so
+        a repeated `time` value is a strong signal that history is
+        exhausted.
+
+        **That signal turned out to be too eager — found from real report
+        data, not speculation (see PLAN.md Section 7).** At least one real
+        `gap-reconcile` run against a ~6-week-wide gap stopped after
+        receiving real, correctly-deduplicated data for only the most
+        recent ~20 days — a report field (`distinct_days_in_result`) that
+        didn't exist until this same investigation made it clear something
+        was cutting the reply short well before the older history (which
+        the retention probe had already proven is genuinely retrievable
+        with enough patience) ever arrived. Something in the middle of a
+        large historical replay apparently *can* repeat a key before the
+        true, final live-tail repeat shows up — an unconditional
+        first-repeat-wins rule stops right there, discarding everything
+        older that would have followed. **Fix: gate the repeat check on
+        recency** (`repeat_key_min_value`, computed here as "within the
+        last 5 minutes of wall-clock now," converted to the same raw
+        millisecond units as the candle's own `time` field so the
+        comparison is apples-to-apples) — a repeat of an old, already-
+        closed candle no longer ends anything by itself; only a repeat
+        that's actually plausibly *the* live candle does. This costs
+        back some of the speed the unconditional version bought (a
+        request may need to ride out more of `idle_timeout_s`/`timeout_s`
+        again for the genuinely slow/throttled portions of a large
+        replay), but speed was never the point if it meant silently
+        returning incomplete data — see this function's own earlier,
+        reverted "catch up to live" attempt for the same lesson learned a
+        different way.
         """
         from tastytrade.dxfeed import Candle
 
         streamer = await self._ensure_streamer()
+        request_started = datetime.now(timezone.utc)
+        # Raw ms-since-epoch, matching event_key's own units (a Candle's
+        # `time` field) — see the recency-gating note above.
+        repeat_key_min_value = int(
+            (request_started - timedelta(minutes=5)).timestamp() * 1000
+        )
 
         subscribed_via = await self._subscribe_candle_compat(streamer, Candle, symbol, period, start_time)
         try:
@@ -360,7 +468,11 @@ class TastyTradeSource(MarketDataSource):
                 timeout_s=timeout_s,
                 max_count=max_count,  # safety net: an in-progress bar can otherwise stream forever
                 event_filter=lambda ev: symbol in str(get_attr_any(ev, "event_symbol", default="")),
-                idle_timeout_s=3.0,  # the real stopping condition in practice — see collect_events docstring
+                idle_timeout_s=idle_timeout_s,
+                stop_on_repeated_key=True,
+                event_key=lambda ev: get_attr_any(ev, "time"),
+                repeat_key_min_value=repeat_key_min_value,
+                diagnostics=diagnostics,
             )
         finally:
             try:
@@ -374,6 +486,28 @@ class TastyTradeSource(MarketDataSource):
                 "If this symbol legitimately has more history than that, raise max_count.",
                 symbol, max_count,
             )
+
+        if diagnostics is not None:
+            # collect_events already populated stop_reason/elapsed_s/event_count —
+            # add the request-level context that makes those numbers actually
+            # interpretable (what was asked for, what came back) without
+            # needing the raw candle list itself. Built specifically for
+            # BackfillJob's diagnostic report — see PLAN.md Section 7 for the
+            # investigation that made clear a summary like this was needed
+            # (several rounds of "share a huge raw log" that a structured
+            # report like this replaces).
+            times = [t for t in (_candle_event_time(ev) for ev in events) if t is not None]
+            diagnostics.update({
+                "symbol": symbol,
+                "requested_start": start_time.isoformat(),
+                "requested_at": request_started.isoformat(),
+                "timeout_s": timeout_s,
+                "idle_timeout_s": idle_timeout_s,
+                "max_count": max_count,
+                "hit_max_count": len(events) >= max_count,
+                "earliest_candle": min(times).isoformat() if times else None,
+                "latest_candle": max(times).isoformat() if times else None,
+            })
 
         return events
 

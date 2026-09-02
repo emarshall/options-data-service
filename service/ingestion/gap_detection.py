@@ -39,6 +39,39 @@ MARKET_TZ = ZoneInfo("America/New_York")
 MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
 
+# **Underlying candle retention is count-based, not date-based — confirmed
+# directly from real per-day density data (see PLAN.md Section 7), not
+# Task 0's original ~6-week finding, which only checked whether *any*
+# event appeared at a boundary date and never checked density. A real
+# gap-reconcile report's `candles_per_day` breakdown showed a sharp
+# cliff (near-zero straight to several hundred/day) at a DIFFERENT
+# calendar date for each of three tickers — SPX ~27 days back, NDX ~23,
+# VIX ~14 — with nothing in between but a single boundary-marker event.
+# Multiplying each ticker's dense-window length by its own per-day candle
+# count landed all three within ~7650-7950 total candles retained,
+# despite the wildly different calendar-day windows and per-day rates
+# (VIX alone is ~2x SPX's per-day volume) — strong evidence of a roughly
+# fixed *count* of trailing candles kept per symbol, not a fixed number
+# of days. A single day-count constant can only approximate this (this
+# codebase doesn't model per-symbol, count-based retention), so this is
+# set conservatively to the *shortest* observed dense window (VIX's ~14
+# days) rather than an average — a higher-frequency symbol added later
+# could plausibly have an even shorter effective window, but this is the
+# best current evidence.
+#
+# Used to bound gap scanning/reconciliation: time before this cutoff can
+# never have a bar no matter what, so treating it as an actionable gap
+# the same way as a real one means `/gaps` and `gap-reconcile` would
+# report — and `gap-reconcile` would keep "trying to fix" — the exact
+# same permanently-unfillable stretch forever. This isn't a bug in this
+# codebase; it's a real, upstream data-availability limit no amount of
+# client-side request tuning can work around — see PLAN.md Section 7 for
+# the full investigation (several rounds of genuine client-side bugs were
+# found and fixed along the way, which is what made it possible to trust
+# this final measurement rather than blaming the retention limit for
+# what were, at the time, real bugs elsewhere).
+RETENTION_DAYS = 14
+
 
 @dataclass(frozen=True)
 class Gap:

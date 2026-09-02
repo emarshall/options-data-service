@@ -15,7 +15,7 @@ against TastyTrade's servers (something these unit tests can't do).
 """
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -293,6 +293,161 @@ async def test_request_candles_unsubscribe_does_not_leak_when_subscribed_via_sub
     )
 
     await source.close()
+
+
+@pytest.mark.asyncio
+async def test_request_candles_wires_repeated_key_condition(source, fake_streamer):
+    """Confirms request_candles() wires collect_events()'s
+    stop_on_repeated_key condition, keyed on each candle's own `time`
+    field — the fix for the real, log-confirmed root cause of the
+    "backfill takes forever" bug (see PLAN.md Section 7): once historical
+    replay finishes, the current candle gets re-broadcast indefinitely
+    with the same `time` value, which this condition detects to stop
+    promptly rather than waiting out idle_timeout_s/timeout_s."""
+    captured_kwargs = {}
+
+    async def fake_collect_events(listen_iter, **kwargs):
+        captured_kwargs.update(kwargs)
+        return []
+
+    import service.sources.tastytrade as ttmod
+
+    orig = ttmod.collect_events
+    ttmod.collect_events = fake_collect_events
+    try:
+        await source.request_candles(".SPY260716C750", "1m", datetime.now(timezone.utc))
+    finally:
+        ttmod.collect_events = orig
+
+    assert captured_kwargs["stop_on_repeated_key"] is True
+    ev = FakeEvent(".SPY260716C750", time=12345)
+    assert captured_kwargs["event_key"](ev) == 12345
+
+    await source.close()
+
+
+@pytest.mark.asyncio
+async def test_request_candles_gates_repeat_on_recency(source, fake_streamer):
+    """Confirms request_candles() computes repeat_key_min_value as "now
+    minus 5 minutes" in the same raw-millisecond units as a candle's own
+    `time` field — the fix for a real regression where the unconditional
+    repeated-key stop fired on a repeat of an OLD key, cutting a large
+    historical replay short well before the true live tail. See PLAN.md
+    Section 7."""
+    captured_kwargs = {}
+
+    async def fake_collect_events(listen_iter, **kwargs):
+        captured_kwargs.update(kwargs)
+        return []
+
+    import service.sources.tastytrade as ttmod
+
+    orig = ttmod.collect_events
+    ttmod.collect_events = fake_collect_events
+    try:
+        before = datetime.now(timezone.utc)
+        await source.request_candles(".SPY260716C750", "1m", datetime.now(timezone.utc))
+        after = datetime.now(timezone.utc)
+    finally:
+        ttmod.collect_events = orig
+
+    threshold_ms = captured_kwargs["repeat_key_min_value"]
+    expected_before = int((before - timedelta(minutes=5)).timestamp() * 1000)
+    expected_after = int((after - timedelta(minutes=5)).timestamp() * 1000)
+    assert expected_before <= threshold_ms <= expected_after
+
+    await source.close()
+
+
+@pytest.mark.asyncio
+async def test_request_candles_populates_diagnostics(source, fake_streamer):
+    """Confirms request_candles() fills in the request-level context
+    (symbol, requested_start, effective timeout/idle_timeout/max_count,
+    earliest/latest candle, hit_max_count) on top of whatever
+    collect_events() itself already populated (stop_reason, elapsed_s,
+    event_count) — built specifically so a diagnostic report can explain
+    a slow/incomplete result without needing the raw candle list or
+    verbose logs. See PLAN.md Section 7."""
+
+    async def fake_collect_events(listen_iter, diagnostics=None, **kwargs):
+        if diagnostics is not None:
+            diagnostics["stop_reason"] = "repeated_key"
+            diagnostics["elapsed_s"] = 1.23
+            diagnostics["event_count"] = 2
+        return [
+            FakeEvent(".SPY260716C750", time=1_700_000_000_000),
+            FakeEvent(".SPY260716C750", time=1_700_000_060_000),
+        ]
+
+    import service.sources.tastytrade as ttmod
+
+    orig = ttmod.collect_events
+    ttmod.collect_events = fake_collect_events
+    try:
+        requested_start = datetime.now(timezone.utc)
+        diag: dict = {}
+        events = await source.request_candles(
+            ".SPY260716C750", "1m", requested_start,
+            timeout_s=99.0, idle_timeout_s=5.0, max_count=50,
+            diagnostics=diag,
+        )
+    finally:
+        ttmod.collect_events = orig
+
+    assert len(events) == 2
+    # From collect_events itself:
+    assert diag["stop_reason"] == "repeated_key"
+    assert diag["elapsed_s"] == 1.23
+    assert diag["event_count"] == 2
+    # From request_candles' own augmentation:
+    assert diag["symbol"] == ".SPY260716C750"
+    assert diag["requested_start"] == requested_start.isoformat()
+    assert diag["timeout_s"] == 99.0
+    assert diag["idle_timeout_s"] == 5.0
+    assert diag["max_count"] == 50
+    assert diag["hit_max_count"] is False
+    assert diag["earliest_candle"] == datetime.fromtimestamp(1_700_000_000_000 / 1000, tz=timezone.utc).isoformat()
+    assert diag["latest_candle"] == datetime.fromtimestamp(1_700_000_060_000 / 1000, tz=timezone.utc).isoformat()
+
+    await source.close()
+
+
+@pytest.mark.asyncio
+async def test_request_candles_diagnostics_is_optional(source, fake_streamer):
+    """Not passing diagnostics at all (the common case) shouldn't error —
+    confirms the feature is purely additive."""
+
+    async def fake_collect_events(listen_iter, **kwargs):
+        return []
+
+    import service.sources.tastytrade as ttmod
+
+    orig = ttmod.collect_events
+    ttmod.collect_events = fake_collect_events
+    try:
+        events = await source.request_candles(".SPY260716C750", "1m", datetime.now(timezone.utc))
+    finally:
+        ttmod.collect_events = orig
+
+    assert events == []
+    await source.close()
+
+
+def test_candle_event_time_extracts_ms_timestamp():
+    from service.sources.tastytrade import _candle_event_time
+
+    ev = FakeEvent(".SPY260716C750", time=1_800_000_000_000)  # ms since epoch
+    result = _candle_event_time(ev)
+
+    assert result == datetime.fromtimestamp(1_800_000_000_000 / 1000, tz=timezone.utc)
+
+
+def test_candle_event_time_returns_none_when_time_missing():
+    from service.sources.tastytrade import _candle_event_time
+
+    ev = FakeEvent(".SPY260716C750")  # no `time` attribute set
+
+    assert _candle_event_time(ev) is None
 
 
 @pytest.mark.asyncio

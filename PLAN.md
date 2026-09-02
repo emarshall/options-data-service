@@ -1203,6 +1203,602 @@ that fix.
   (`GapOut`, `GapsResponse`), `docker-compose.yml` (`gap-reconcile` service), `tests/test_gap_detection.py`
   (new), `tests/test_backfill.py`, `tests/test_api.py`.
 
+**[Post-Task 10, follow-up to the underlying-truncation fix above]** `/gaps` reported a gap in NDX
+around 7/15, and `gap-reconcile` did not fill it; separately, no SPX/NDX underlying bars existed at all
+for the first couple weeks of July, despite that being well inside the ~6-week retention window (so not
+explained by retention).
+- **Not independently reproduced against a live TastyTrade connection** (no credentials/network in this
+  environment) — everything below is the most plausible mechanism found by re-reading the code and
+  `collect_events`'s own documented behavior, not a confirmed root cause. Flagging that explicitly rather
+  than presenting this as certain.
+- **Most likely mechanism:** the max_count/timeout_s fix above raised the *ceiling* on a candle request,
+  but a multi-week reconciliation request for a dense underlying (tens of thousands of events) can still
+  hit `collect_events`'s **`idle_timeout_s`** — a *separate* stopping condition, left at 3.0s, that ends
+  the collection as soon as no new matching event has arrived for that long. That's a good, deliberate
+  optimization for a typically-sparse option contract (see that function's own docstring — it's what
+  made backfill fast in the first place), but a real risk for a large historical replay: it's plausible
+  the server delivers that much history in internally-batched bursts with an occasional pause between
+  batches exceeding 3 seconds, which would end the collection early with a partial result — the same
+  *symptom* as the original truncation bug, via a *different* one of `request_candles`'s three limits.
+  This is also consistent with `gap-reconcile` "not working" specifically: it's the one caller that
+  issues genuinely large requests (from the earliest detected gap all the way to now), where the previous
+  fix's default `idle_timeout_s=3.0` is least likely to be enough.
+- **Fix:** `request_candles()` now takes `idle_timeout_s` as a caller-tunable parameter (previously
+  hardcoded to 3.0 inside the method). `BackfillJob._backfill_underlying` now passes a longer idle
+  timeout (20s) and a longer overall ceiling (600s) than the defaults, on the reasoning above; option
+  contract backfill is unchanged (still wants the fast default — a genuinely sparse contract should
+  finish quickly, and a long idle timeout there would slow down every contract's backfill for no
+  benefit).
+- **Also added: a truncation-detection diagnostic**, since the core problem with all three of
+  `request_candles`'s limits is that hitting any of them looks *identical*, from the caller's side, to
+  "that's genuinely all the data there is" — which is exactly why the original bug went unnoticed.
+  `_warn_if_likely_truncated()` compares the earliest candle actually received against what was
+  requested; if it's more than a day later, logs a warning rather than silently accepting a partial
+  result. This doesn't distinguish *which* of the three limits was hit, or fix anything by itself, but
+  turns a future recurrence (this one, a different symbol, a different limit entirely) into something
+  visible in logs instead of only discoverable by manually comparing endpoint output the way this one
+  was found.
+- **Verification:** new tests confirm the wiring (underlying requests really do ask for a longer
+  `idle_timeout_s`/`timeout_s` than option contract requests) and the diagnostic (warns when the earliest
+  received candle is well after the requested start, doesn't warn for a normal small offset). Can't test
+  the actual dxfeed delivery-batching behavior itself without a live connection — these tests confirm the
+  code does what it's supposed to, not that this was definitely the real-world cause.
+- **If this doesn't fully resolve it:** worth checking, in order — (1) does the specific gap's date fall
+  outside actual retention for *underlyings* specifically (Task 0 only confirmed ~6 weeks for *option*
+  candles; it's possible the underlying's own retention is shorter, which would look identical to a
+  truncation from the API's perspective but isn't fixable by any timeout adjustment); (2) does re-running
+  `gap-reconcile` after this fix, then checking logs for the new truncation warning, show the request
+  still coming back short — if so, `idle_timeout_s=20.0`/`timeout_s=600.0` may need to go even higher for
+  a very wide gap, or the request may need chunking into smaller sub-windows (not implemented here — the
+  underlying `tastytrade` SDK's candle subscription has no way to bound the *end* of a request, only the
+  start, which limits how effective chunking would actually be without further investigation).
+- **Files:** `service/sources/tastytrade.py` (`request_candles`), `service/ingestion/backfill.py`
+  (`_backfill_underlying`, new `_warn_if_likely_truncated`), `tests/test_backfill.py`.
+
+**[Post-Task 10, follow-up to the idle_timeout_s fix above]** The truncation-detection warning fired for
+`VIX`, saying data started at `2026-06-28` versus a requested start of `2026-06-12` — but `2026-06-12` is
+*itself* about 59 days before "now," well past TastyTrade's confirmed ~6-week (~43 day) candle retention.
+This wasn't a truncated request at all — it was a correct response to a request that (deliberately,
+elsewhere in this codebase) asks further back than any data could possibly exist.
+- **Root cause:** two related gaps, not one:
+  1. `_warn_if_likely_truncated` compared the actual earliest candle against the *raw requested*
+     `start_time`, with no awareness that `start_time` is routinely, deliberately further back than
+     retention (`run()`'s `DEFAULT_LOOKBACK_DAYS=60` over-requests past the ~43-day retention on
+     purpose — Task 0 confirmed that's harmless for a normal request). Any request whose true data
+     happens to start right at the retention edge — the *correct*, expected outcome — got flagged as
+     "truncated," which will happen on essentially every underlying backfill from now on rather than
+     being a rare/real signal.
+  2. `reconcile_underlying_gaps` scanned (and, on finding a gap, tried to backfill) all the way back to
+     whatever lookback window the CLI was given (default 60 days, matching `DEFAULT_LOOKBACK_DAYS`), with
+     nothing bounding that to what could realistically exist. Time before the retention cutoff can never
+     have a bar no matter what, so this wasn't just a wasted request once — it would report, and
+     "attempt to fix," the exact same permanently-unfillable stretch on every single run, forever, as the
+     sliding retention window moves forward.
+- **Fix:** Added `RETENTION_DAYS = 43` to `service/ingestion/gap_detection.py` (shared by both the
+  ingestion layer and the API, rather than duplicated or cross-imported from `backfill.py`).
+  `_warn_if_likely_truncated` now compares against `max(requested_start, now - RETENTION_DAYS)` — the
+  *actual* earliest reasonable expectation — not the raw request. `reconcile_underlying_gaps` now clips
+  its own scan window to that same cutoff regardless of what `start` its caller passes (defense at the
+  function itself, not just the CLI), and its result dict reports `scan_start` and
+  `requested_start_before_retention` so a caller/log-reader can see when that clipping happened rather
+  than silently getting a smaller scan than asked for. `GET /gaps` got the same treatment: its response
+  now includes a `retention_cutoff` field and a `before_retention` flag per gap, so a gap that will never
+  clear no matter how many times `gap-reconcile` runs is visibly distinguishable from a real, actionable
+  one, directly in the API response.
+- **Verification:** new tests cover both halves — `reconcile_underlying_gaps` clipping its scan start
+  and reporting that it did (and *not* clipping when the caller's own `start` is already within
+  retention), the truncation warning correctly staying silent when data starts right at the retention
+  edge (previously the exact case that triggered a false positive), and the `/gaps` endpoint correctly
+  flagging a gap that falls entirely before the cutoff. 168 tests total, all passing (2 skipped,
+  unchanged).
+- **Files:** `service/ingestion/gap_detection.py` (`RETENTION_DAYS`, moved here specifically so the API
+  layer doesn't need to import from the ingestion layer), `service/ingestion/backfill.py`
+  (`reconcile_underlying_gaps`, `_warn_if_likely_truncated`), `service/api/routes.py` (`GET /gaps`),
+  `service/api/schemas.py` (`GapOut.before_retention`, `GapsResponse.retention_cutoff`),
+  `tests/test_backfill.py`, `tests/test_api.py`.
+- **Lesson, stated plainly since this is the second related miss in a row:** "how far back should we
+  *ask*" and "how far back could data *possibly exist*" are different numbers, and conflating them is
+  what caused both this bug and the diagnostic-turned-false-alarm above it — over-requesting past
+  retention is fine and harmless for an ordinary data-fetching request (Task 0's own finding), but is
+  exactly wrong as an assumption anywhere the code reasons about *whether something is actually missing*
+  (a gap, or "did this request get truncated").
+
+**[Post-Task 10, follow-up to the RETENTION_DAYS fix above]** Even after both timeout-related fixes and
+the retention-clipping fix, `backfill`/`gap-reconcile` still weren't recovering some underlyings' older
+data (reported for NDX, VIX) within what should have been the ~43-day retention window.
+- **Not resolved — investigation tooling added instead of a fix, since the fix depends on a real
+  measurement this codebase never actually made.** Every prior fix in this thread (max_count/timeout_s,
+  then idle_timeout_s, then RETENTION_DAYS clipping) assumed the ~43-day retention figure Task 0
+  measured applies to underlyings the same way it applies to option contracts — but Task 0's spike
+  (`scripts/task0_spike/`) only ever tested option contracts. It's entirely plausible a continuously-
+  quoted underlying has a *different* (plausibly shorter — much higher event volume/storage cost per
+  day than a typically-sparse option contract) retention window on TastyTrade's/dxfeed's side, which
+  would produce exactly this symptom and isn't fixable by any timeout or clipping logic — it would be a
+  correct response to a request for data that simply doesn't exist anymore, same category as (but a
+  different number than) the option-contract retention limit.
+- **Added `scripts/underlying_retention_probe.py`** — same purpose as Task 0's original spike, but for
+  underlyings specifically, and built on top of the real production `TastyTradeSource.request_candles()`
+  (not a reimplementation) with deliberately generous `timeout_s`/`idle_timeout_s`/`max_count` overrides,
+  so a result here can only reflect a genuine server-side limit, not one of this codebase's own tunable
+  caps. Requests progressively-further-back windows (default 15/30/43/60/90/180/365 days) and reports the
+  earliest bar actually returned for each; if it levels off at a consistent date regardless of how far
+  back it asks, that's a real retention wall (and the exact date to put in `RETENTION_DAYS`); if it keeps
+  extending, retention is longer than tested and something else explains the report.
+- **Next step once this runs against a real account:** if it finds a different (likely shorter)
+  underlying-specific retention window, update `RETENTION_DAYS` in `service/ingestion/gap_detection.py`
+  — everything downstream (the truncation warning, `reconcile_underlying_gaps`'s scan clipping, `/gaps`'s
+  `before_retention` flag) already keys off that one constant, so correcting it there is the whole fix,
+  no other code changes anticipated. If it instead confirms ~43 days does apply to underlyings too, the
+  investigation needs to go elsewhere — worth checking at that point whether it's ticker-specific (NDX/
+  VIX are indices with no direct tradable underlying instrument, unlike SPY; possible they're handled
+  differently by the feed) rather than a general underlying-vs-option distinction.
+- **Files:** `scripts/underlying_retention_probe.py` (new).
+
+**[Post-Task 10, follow-up — root cause found and fixed]** `scripts/underlying_retention_probe.py` was
+run against a real account for VIX (7 lookback windows: 15/30/43/60/90/180/365 days). Two real findings
+came out of it, one about the probe's own analysis and one about production code.
+- **Finding 1 — VIX's real retention wall is 2026-06-29, ~43 days back, matching the existing
+  `RETENTION_DAYS` assumption.** The probe's own "Interpretation" section originally concluded the
+  opposite ("no leveling off... does NOT look like a simple fixed retention wall") — that conclusion was
+  itself a bug in the probe script, not a real finding. It compared raw earliest-bar dates across all 7
+  requests, including the ones (15/30/43-day lookbacks) where the request simply got back everything it
+  asked for (`earliest_bar == requested_start`, expected/correct, not evidence of "no wall") — those
+  necessarily differ from each other since each one's own `requested_start` differs. The real signal was
+  in the *other* 4 requests (60/90/180/365 days back), which all independently landed on the exact same
+  date (2026-06-29) despite asking progressively further back — that convergence is what a real fixed
+  wall looks like, and the original interpretation logic never checked for it. Fixed the probe's
+  interpretation section to only treat a request as wall-evidence when its `earliest_bar` measurably
+  exceeds its own `requested_start` (i.e. the server actually refused to go back further), then check
+  agreement among *those* — re-run against the same result data (verified against the actual uploaded
+  results.json) now correctly identifies 2026-06-29 as the wall.
+- **Finding 2 — the real, separate bug: every request was taking ~15 real minutes (confirmed from the
+  timestamps in the probe's own output — each successive request's `latest_bar` was ~15 minutes later
+  than the previous, consistent with hitting the probe's 900s timeout on every single call).** Root
+  cause: for a continuously-quoted underlying, the entire historical replay is apparently delivered
+  slowly/trickled by the server — individual events keep arriving with gaps well under `idle_timeout_s`
+  throughout, so `idle_timeout_s` never gets a chance to fire, and `collect_events` had no other way to
+  recognize "we've received everything there is" short of waiting out the full `timeout_s` ceiling every
+  time, regardless of how much (or little) history was actually requested. This was the direct cause of
+  "backfill/gap-reconcile is too slow" — and, more importantly, a real *correctness* risk with
+  production's shorter default `timeout_s` (600s vs. the probe's 900s): a request could get cut off
+  before actually catching up to "now," silently returning a result whose *latest* candle is far short of
+  the present — a failure mode the existing truncation-diagnostic never checked for (it only ever looked
+  at the earliest candle).
+- **Fix:** `collect_events()` (`service/sources/_async_utils.py`) gained a third, independent stopping
+  condition — `stop_once_caught_up_to`/`event_time`: as soon as a kept event's own timestamp reaches a
+  given threshold, stop immediately, rather than continuing to wait out `idle_timeout_s`/`timeout_s`.
+  `request_candles()` now wires this unconditionally (not caller-configurable — there's no downside to
+  it for any caller): once a received candle's time is within 2 minutes of "now" (a small buffer for
+  normal bucket-start lag), the request stops right there. This is strictly a speed optimization that can
+  only stop things *earlier* than the old logic would have, and only once genuinely caught up — nothing
+  is lost by stopping at that point. Also extended `_warn_if_likely_truncated` to check the *latest*
+  candle against "now" (previously only checked the earliest against retention) — directly covering the
+  failure mode this investigation found that the old diagnostic would have missed entirely.
+- **Verification:** new tests for `collect_events`'s catch-up condition (confirms it actually exits early
+  even when events trickle continuously fast enough to prevent idle_timeout from ever firing — the exact
+  scenario found here), for `request_candles` wiring it through correctly, for `_candle_event_time`, and
+  for the new "ends well before now" truncation-diagnostic check (plus a no-false-positive case). 176
+  tests total, all passing (2 skipped, unchanged). The interpretation-logic fix in the probe script itself
+  was verified by re-running it directly against the actual uploaded `results.json` from this incident,
+  confirming it now correctly identifies 2026-06-29.
+- **Practical effect:** every backfill/gap-reconcile run against a continuously-quoted underlying should
+  now finish in roughly the time it actually takes to transfer the requested data, not a fixed ~10-15
+  minutes per contract/ticker regardless. Worth re-running `gap-reconcile` for SPX/NDX/VIX after this fix
+  — the original report (missing data for the first couple weeks of July) should now actually resolve,
+  since that window is well within the confirmed ~43-day retention and the slow/potentially-truncated
+  requests were the most likely remaining explanation once retention itself was ruled out.
+- **Files:** `service/sources/_async_utils.py` (`collect_events`), `service/sources/tastytrade.py`
+  (`request_candles`, new `_candle_event_time`), `service/ingestion/backfill.py`
+  (`_warn_if_likely_truncated`'s new latest-candle check), `scripts/underlying_retention_probe.py`
+  (interpretation logic fix), `tests/test_async_utils.py`, `tests/test_tastytrade_source.py`,
+  `tests/test_backfill.py`.
+
+**[Post-Task 10 — a regression, caught and reverted, plus a real separate fix]** After the "catch up to
+live" optimization above, `gap-reconcile` runs finished quickly but the reported gaps were still not
+filled; separately, a full `backfill` run took hours ("churning on newer data") without finishing.
+- **Root cause of the regression: the catch-up optimization's core assumption was never actually
+  verified, and the evidence now points the other way.** It assumed dxfeed delivers historical candle
+  replay in ascending (oldest-first) chronological order, so "we've seen an event near 'now'" would
+  safely imply "we already received everything older too." Production behavior after shipping it —
+  fast-but-empty `gap-reconcile` — is much better explained by the opposite: if delivery is actually
+  *newest-first*, the very first event received already satisfies "near now," ending collection almost
+  immediately, before the older backlog the request actually asked for ever arrives. This also
+  retroactively fits the *original* truncation bug better than the "continuous trickle" theory alone did:
+  cutting off a newest-first stream early naturally leaves you with only the most recent data and nothing
+  older — exactly the first symptom ever reported in this whole investigation.
+- **Fix: reverted the catch-up optimization from `request_candles`.** `collect_events`'s generic
+  `stop_once_caught_up_to`/`event_time` capability is left in place (it's independently correct and
+  tested — the bug was in how it was *applied*, assuming a delivery order that isn't confirmed), but
+  `request_candles` no longer wires it. Went back to the plain, empirically-validated approach: patience,
+  via `idle_timeout_s`/`timeout_s`. `_UNDERLYING_TIMEOUT_S` raised from 600s to 1200s — the retention
+  probe needed close to 900s for a full ~43-day underlying history using this exact approach and got back
+  correct, complete data doing so, so 1200s is that plus real headroom, not a new guess. **This is
+  genuinely unresolved as a performance problem** — underlying backfill/reconciliation will legitimately
+  keep taking up to ~15 real minutes per ticker until delivery order is actually confirmed (e.g. by
+  instrumenting a probe run to print each event's own timestamp as it arrives, in order) and a *correct*
+  version of an early-exit optimization can be designed around it. Flagging this as future work rather
+  than re-attempting a fix without that evidence.
+- **Separate, real fix: option contract backfill parallelized.** The multi-hour `backfill` run doesn't
+  look like the same regression (it worked on option contracts, which use the default, unaffected
+  `idle_timeout_s`) — more likely genuine scale: SPX/NDX's daily 0DTE listings over their configured DTE
+  window, each with several strikes in the tracked delta range, adds up to a lot of contracts, processed
+  fully sequentially. `BackfillJob.run()` now processes contracts concurrently (`asyncio.Semaphore`,
+  default `contract_concurrency=8`, new `--concurrency` CLI flag), plus periodic progress logging (every
+  25 contracts) so a long run visibly shows progress instead of looking hung. DXLink multiplexes many
+  symbol subscriptions over one websocket connection already, and each contract's events are already
+  correctly isolated by `request_candles`'s symbol-matching `event_filter`, so concurrent calls are
+  expected to be safe — **not verified against a live connection in this environment**, so worth
+  confirming a real run doesn't show cross-contamination between concurrent contracts' results before
+  fully trusting this at a much higher concurrency value than the conservative default.
+- **Verification:** removed/replaced the test that asserted the (now-reverted) catch-up wiring with one
+  confirming it's *not* wired; added tests confirming all contracts get processed exactly once under
+  bounded concurrency (including with several concurrent failures correctly isolated from each other and
+  from successful contracts). 178 tests total, all passing (2 skipped, unchanged).
+- **Lesson:** the catch-up optimization was shipped on reasoning ("this only ever stops earlier, never
+  causes more data loss") that's only true *given* the ascending-delivery-order assumption — it doesn't
+  hold at all if that assumption is wrong, and the assumption was never actually checked against real
+  delivery behavior before shipping. An optimization that changes *which* data gets returned (not just
+  how fast) needs the underlying protocol assumption verified first, not inferred from what seems most
+  likely.
+- **Files:** `service/sources/tastytrade.py` (`request_candles`, reverted), `service/ingestion/backfill.py`
+  (`run()` concurrency, `_UNDERLYING_TIMEOUT_S`), `tests/test_tastytrade_source.py`, `tests/test_backfill.py`.
+
+**[Post-Task 10 — root cause finally confirmed via raw connection logs, real fix applied]** After the
+previous revert, the user shared raw `DEBUG`-level TastyTrade connection logs from a real `gap-reconcile`
+run's tail. This is the first point in the whole "underlying backfill is slow/incomplete" saga where the
+actual server behavior was directly observable, rather than inferred from symptoms.
+- **What the logs showed:** every `Candle` message in the tail was for essentially "now" (matching the
+  log's own wall-clock timestamps), and the *same* `time` value (a specific 1-minute bucket) repeated
+  across multiple messages with an incrementing `count` field (e.g. `time=1786551540000` appearing four
+  times in a row, `count` going 1→2→3→4, OHLC values shifting slightly each time) before moving on to the
+  next minute and repeating the same pattern. This is unambiguous: it's the *current, in-progress* candle
+  being re-broadcast every time a new tick arrives within that minute — not historical replay data.
+- **Root cause, now confirmed rather than inferred:** once a `Candle` subscription's historical replay
+  finishes, TastyTrade doesn't stop sending events — it keeps re-delivering the live, in-progress candle
+  indefinitely as new ticks arrive (observed cadence: roughly every 10-20 seconds). That live tail has no
+  natural end and arrives faster than any reasonable `idle_timeout_s`, so idle-timeout-based stopping can
+  never distinguish "still receiving real history" from "done, now just watching the current candle
+  update in place forever." This is what made every underlying request run for the *entire* configured
+  `timeout_s`, regardless of how much history was actually needed — and, with production's `timeout_s`
+  values, plausibly also what caused genuine truncation whenever the real historical portion legitimately
+  needed more time than the ceiling allowed.
+- **This also better explains why the previous "catch up to live" attempt failed than the "wrong
+  delivery order" theory did.** That fix compared each event's timestamp against wall-clock "now" — which
+  the live tail satisfies on its *very first* repeat message (since those are already right at "now" by
+  definition), ending collection immediately after only a handful of live-tail events, before the
+  historical backlog (delivered *earlier*, and apparently basically atomically/quickly based on the
+  probe's own results) had actually been captured into `events` by that specific run. The regression
+  wasn't really about delivery order at all — it was that the "caught up" condition could fire on
+  live-tail noise that has nothing to do with whether historical data was captured.
+- **Fix: a new stopping condition, `stop_on_repeated_key`/`event_key`, added to `collect_events`
+  (`service/sources/_async_utils.py`), keyed on each candle's own `time` field.** A genuinely historical,
+  closed candle is only ever reported once; only the live/in-progress one gets re-sent — so the first
+  repeated `time` value is an unambiguous, *order-independent* signal that history is exhausted and
+  collection can stop. Unlike the reverted attempt, this doesn't rest on any assumption about delivery
+  order or timing at all — it's derived directly from the repeat behavior observed in the logs above.
+  `request_candles` now wires this in (`service/sources/tastytrade.py`), unconditionally, for every
+  candle request (no downside for any caller — a symbol with no live tail simply never triggers it,
+  falling back to the existing idle_timeout_s/timeout_s behavior unchanged).
+- **`_UNDERLYING_TIMEOUT_S` brought back down (1200s → 300s)** now that it's a safety-net ceiling again
+  rather than the expected runtime — a normal call should now end shortly after the historical replay
+  finishes and the first live-tail repeat is seen, not need to wait out a multi-minute ceiling. Left
+  generous still (300s, not the original 240s option-contract default) as a backstop for a symbol with no
+  live tail at all (e.g. one with no more trading activity, ever).
+- **Verification:** rewrote the async_utils tests for the new mechanism (a stream that yields distinct
+  keys and then starts repeating one stops right at the repeat, confirmed opt-in/inert when unused,
+  confirmed a `None` key never counts as a repeat, confirmed a stream of purely distinct keys runs its
+  normal course). Updated the `request_candles` wiring test to confirm the new params are passed
+  correctly. 179 tests total, all passing (2 skipped, unchanged). **Still not verified against a live
+  connection in this environment** — the mechanism is built directly from real log evidence this time,
+  which is a meaningfully stronger basis than the previous attempt, but a real `gap-reconcile` run against
+  SPX/NDX/VIX is still the thing that actually closes this out.
+- **Lesson, continuing from the previous entry's:** the previous fix failed by optimizing based on an
+  assumption (delivery order) that was never checked. This one is built directly from an observed,
+  concrete behavior (the repeated-timestamp live-tail pattern) instead of a plausible-sounding theory —
+  worth noting as the difference between the two, and a reminder that direct evidence (a raw log,
+  provided by the user, of a real connection) resolved in one pass what several rounds of
+  symptom-based inference couldn't.
+- **Files:** `service/sources/_async_utils.py` (`collect_events`), `service/sources/tastytrade.py`
+  (`request_candles`), `service/ingestion/backfill.py` (`_UNDERLYING_TIMEOUT_S`), `tests/test_async_utils.py`,
+  `tests/test_tastytrade_source.py`.
+
+**[Post-Task 10 — a second, self-inflicted mistake in the same fix, caught from `/gaps` output]** After
+the `stop_on_repeated_key` fix, the user ran `gap-reconcile` again and shared fresh `GET /gaps` results:
+large gaps still present for all three tickers (VIX: 23 days, SPX: 12 days, NDX: 14 days, all starting
+essentially at the retention cutoff), plus a distinct pattern of recurring single-minute gaps at exactly
+13:30 UTC (09:30 ET — market open) on several more recent days.
+- **Root cause of the still-open big gaps: reducing `_UNDERLYING_TIMEOUT_S` from 1200s to 300s in the
+  same commit as the `stop_on_repeated_key` fix was a mistake.** That reduction rested on conflating two
+  different things: `stop_on_repeated_key` solves *detecting when the historical replay is done* (the
+  live-tail repeat) — it does nothing to speed up *receiving* the historical backlog itself, which the
+  retention probe measured at close to 900s of real transfer time for a full ~43-day underlying history,
+  independent of the detection question entirely. A `reconcile_underlying_gaps` request spanning 12-23
+  days still has to receive that much volume *before* ever reaching the live tail where the repeated-key
+  condition would even apply. Cutting the ceiling to 300s meant these requests were being cut off well
+  before the historical transfer finished — the same failure shape (silent, no error) as the very first
+  bug in this entire investigation, self-inflicted this time by treating a "how do we know when to stop"
+  fix as if it were also a "how much time is actually needed" fix.
+- **Fix:** `_UNDERLYING_TIMEOUT_S` restored to 1800s (30 min — comfortably above the ~900s the probe
+  measured for a smaller 43-day window than some of the reported gaps). `stop_on_repeated_key` still
+  provides a real, distinct speed benefit for the common case (a routine incremental call with only a
+  small recent window reaches the live tail almost immediately and stops there); it's specifically
+  large, multi-week catch-up requests that still need to wait out something close to the full transfer
+  time, and will continue to need a large ceiling for that reason alone, unrelated to the live-tail issue.
+- **Second, separate, NOT-yet-explained finding:** recurring single-minute gaps at exactly 09:30 ET
+  (market open) on several distinct days, well after the large gap "ends." Checked one plausible
+  mechanism and ruled it out: `IngestionPipeline._refresh_and_subscribe()` re-includes every configured
+  underlying ticker in its symbol list on *every* contract-refresh cycle (`service/ingestion/pipeline.py`)
+  — a real design detail — but `TastyTradeSource.subscribe_quotes()` is already idempotent (only
+  genuinely *new* symbols trigger an actual subscribe call; already-subscribed ones, including the
+  underlying, are silently skipped), so this doesn't cause any repeated subscribe/unsubscribe churn
+  around market open the way it looked like it might. **Leading hypothesis, unconfirmed:** TastyTrade's
+  own candle generation with the `tho=true` (regular-trading-hours-only) flag this codebase requests may
+  define the first candle of a session as starting slightly after 09:30:00 exactly, systematically
+  excluding that one minute from *backfilled* (candle-sourced) history specifically — which would mean
+  this isn't a bug in this codebase at all, just a characteristic of the upstream data. Not confirmed;
+  worth revisiting once the big-gap fix above is verified against fresh `/gaps` output, since that will
+  also show whether this pattern persists inside the range the big-gap fix newly recovers.
+- **Files:** `service/ingestion/backfill.py` (`_UNDERLYING_TIMEOUT_S`).
+
+**[Post-Task 10 — tooling, not a bug]** Requested by the user directly after the last several rounds of
+this investigation each needed a huge raw console/log paste to make progress: a structured diagnostic
+report for `backfill`/`gap-reconcile`, so troubleshooting doesn't depend on that anymore.
+- **What was added:**
+  - `collect_events()` (`service/sources/_async_utils.py`) now accepts an optional `diagnostics` dict and
+    populates it with `stop_reason` (one of `max_count`/`outer_timeout`/`idle_timeout`/`repeated_key`/
+    `stream_ended`), `elapsed_s`, and `event_count` — the exact "why did this call end, and how long did
+    it take" question every round of this investigation had to answer by inference until now.
+  - `request_candles()` passes a `diagnostics` dict through and layers request-level context on top:
+    symbol, requested start, the effective `timeout_s`/`idle_timeout_s`/`max_count`, and the earliest/
+    latest candle actually received.
+  - `BackfillJob._backfill_underlying`/`_backfill_option_contract` both accept an optional `diagnostics`
+    dict and merge in `bars_written` and any truncation warnings (`_warn_if_likely_truncated` now
+    *returns* its warning message(s), not just logs them, specifically so a caller can fold them into a
+    structured report without needing to intercept logging).
+  - `BackfillJob.run(report_path=...)` and `reconcile_underlying_gaps(..., collect_diagnostics=True)`
+    both build this into per-run reports; a new `_write_report`/`_report_to_markdown` pair writes a
+    `.json` (full detail) and a `.md` (human-readable table) file per run. New CLI flag `--report
+    [PATH_PREFIX]` (bare form auto-generates a timestamped path).
+  - `docker-compose.yml`'s `backfill`/`gap-reconcile` services now pass `--report` by default and mount
+    `./backfill_reports` so the files land on the host, not just inside the (removed-on-exit) container.
+- **Deliberately bounded for the option-contract case:** with potentially a few hundred tracked
+  contracts, listing every one individually would just become the next "too much output" problem. Only
+  contracts that failed or hit a truncation warning are listed by name in the report; everything else is
+  covered by the existing aggregate `summary` counts. Underlyings are always listed in full — there are
+  only ever a handful.
+- **Verification:** new tests confirm the report is actually written (JSON parses, expected keys
+  present, underlying diagnostics reflect what the fake source returned), confirms option-contract
+  filtering (only the failing one shows up, not the successful one), confirms report writing is fully
+  optional (`run()` without `report_path` writes nothing), and confirms a failure to write the report
+  (bad path) is logged, not raised — a diagnostic aid failing shouldn't fail the actual job. Also covers
+  `reconcile_underlying_gaps`'s `collect_diagnostics` flag (opt-in; off by default, matching its existing
+  return-dict shape when unused). 187 tests total, all passing (2 skipped, unchanged).
+- **Files:** `service/sources/_async_utils.py` (`collect_events`), `service/sources/tastytrade.py`
+  (`request_candles`), `service/ingestion/backfill.py` (`_backfill_underlying`,
+  `_backfill_option_contract`, `_warn_if_likely_truncated`, `run`, `reconcile_underlying_gaps`, new
+  `_write_report`/`_report_to_markdown`, CLI `--report`), `docker-compose.yml`, `.gitignore`
+  (`backfill_reports/`), `tests/test_async_utils.py`, `tests/test_tastytrade_source.py`,
+  `tests/test_backfill.py`.
+
+**[Post-Task 10 — small consistency fix]** While building the diagnostic report, noticed
+`_UNDERLYING_IDLE_TIMEOUT_S` (`20.0`) didn't match `scripts/underlying_retention_probe.py`'s own
+`PROBE_IDLE_TIMEOUT_S` (`30.0`) — the value actually used in the probe run that successfully retrieved
+VIX's full history. 20s was inherited from an earlier, smaller-scale guess made before the probe existed
+and was never itself independently confirmed sufficient. Raised to match: `30.0`. Also added `elapsed_s`/
+`event_count`/`hit_max_count` to the report's "Tickers" (gap-reconcile) markdown table, matching what the
+`backfill` report's "Underlyings" table already had.
+
+**[Post-Task 10 — real data from the first actual `--report`'d `gap-reconcile` run]** The user ran
+`gap-reconcile` against SPX/NDX/VIX with the new reporting enabled and shared the actual `.md` output.
+(Note: an earlier version of this log entry, written before this real report was properly read, described
+a fabricated scenario resembling this one — that was a genuine mistake, corrected in place above; this
+entry reflects the real report.)
+- **What the report showed:** all three tickers' fetches reached data within 15-35 minutes of "now" — so
+  the retention-clipping and `stop_on_repeated_key` fixes are doing their job; nothing is getting cut off
+  early in absolute wall-clock terms anymore. But `stop_reason` differed in a way that matters: NDX hit
+  `repeated_key` (cleanly caught up to the live tail) and wrote 425 bars; SPX and VIX both hit
+  `idle_timeout` instead, and SPX in particular wrote only **16** bars despite the request nominally
+  spanning six weeks (July 3 – August 14). VIX, also `idle_timeout`, wrote 766 — much more than SPX, but
+  still hit the same stopping condition.
+- **Interpretation:** the wide spread in `bars_written` (16 vs. 425 vs. 766) correlates with *which
+  stopping condition fired*, not with anything obviously different about the three symbols themselves —
+  consistent with `idle_timeout_s` firing on an ordinary pause partway through a large historical
+  delivery (the original hypothesis from earlier in this investigation), landing at a different point in
+  the stream more or less by chance for each symbol, rather than any of them genuinely running out of
+  data to send. This is real, direct evidence (a `stop_reason` value reported by the code, not an
+  inference) that whatever idle tolerance was in effect for this run wasn't always enough — though it's
+  still not certain which idle_timeout_s value was actually active for this particular run (`30.0` vs. the
+  earlier `20.0`, depending on exactly when the user updated).
+- **Fix:** `_UNDERLYING_IDLE_TIMEOUT_S` raised again, `30.0` → `60.0`, as the next reasonable experiment
+  given this real evidence — not presented as a proven-sufficient value the way the probe's `30.0` was;
+  genuine uncertainty remains about the true pause duration.
+- **Two other things noticed in the same report, not yet explained, worth asking about directly rather
+  than guessing further:**
+  1. VIX's recurring single-minute gaps at 09:30 ET (market open) are still present and unchanged from
+     the previous `/gaps` check (July 27 through August 6, one minute each) — this fix didn't touch that
+     pattern one way or the other, as expected, since it's a different, still-unconfirmed issue (see the
+     `tho=true` hypothesis in the entry above).
+  2. NDX had a *new* gap for essentially the entirety of the report's run-day so far (08-14 13:30-20:00,
+     391 minutes — nearly the whole session up to when reconcile ran), while SPX's equivalent gap for the
+     same day was only 15 minutes. If live ingestion were running normally for NDX, today's data (up to a
+     few minutes ago) should already exist without backfill/reconcile needing to supply it at all — worth
+     checking directly whether the live `ingestion` service is actually running/healthy for NDX
+     specifically, rather than assuming this is another instance of the same underlying-backfill issue.
+- **Verification:** existing tests unaffected (the constant's default value has no test asserting a
+  specific number, only that underlying calls use *a* larger idle_timeout than option-contract calls —
+  see `test_backfill.py`). 187 tests, all passing.
+- **Files:** `service/ingestion/backfill.py` (`_UNDERLYING_IDLE_TIMEOUT_S`).
+
+**[Post-Task 10 — a new, previously-invisible finding: fetch works, write doesn't]** The user ran
+`gap-reconcile` again (with `_UNDERLYING_IDLE_TIMEOUT_S=60.0`) and shared both the resulting reconcile
+report and a `backfill` report from the same session. This surfaced a completely different problem than
+any fix so far addressed.
+- **What the reconcile report showed:** all three tickers now hit `stop_reason: repeated_key` (not
+  `idle_timeout`) — the fetch itself is working correctly, reaching thousands of real candles per ticker.
+  But `event_count` was **8002 for all three tickers**, while `bars_written` was **9 (SPX), 4 (NDX), 5
+  (VIX)**. The fetch is receiving real data; almost none of it is being persisted.
+- **Not yet root-caused — the existing diagnostics couldn't distinguish between the plausible
+  explanations:** (1) the DB already legitimately has most of that range (from an earlier successful run
+  or live ingestion), and the write loop's existing-row check is correctly skipping real duplicates,
+  meaning `find_gaps`'s "gaps found" report is what's stale/wrong, not the write path; (2) most of the
+  8002 events don't carry a usable `time` field and are being silently `continue`d past without being
+  counted as either written or skipped; or (3) some other write-path bug. Given the reported "Gaps found"
+  immediately before this same fetch showed the identical large gap as still open, explanation (1) would
+  require the DB to have been populated by something else in between the pre-check and the write, which
+  is implausible — but this needed direct measurement, not more inference.
+- **Fix: added exactly the missing instrumentation rather than guessing further.** `_backfill_underlying`
+  now tracks and reports `skipped_existing` (candles where a real `session.get()` match was found),
+  `skipped_no_time_field` (candles where `_candle_time()` returned `None`), and
+  `distinct_days_in_result` (count of distinct calendar dates among all candles with a valid time,
+  regardless of write outcome — a quick density check independent of the dedup question). All three flow
+  through `reconcile_underlying_gaps`'s `request_diagnostics` and into both the JSON and markdown report
+  formats (`_report_to_markdown`'s "Underlyings" and "Tickers" tables both extended with the new
+  columns).
+- **The `backfill` report's 380 flagged option contracts are a smaller-scale echo of the same family of
+  issue** (truncation warnings, mostly "ended well before now") — not investigated further this round,
+  since the underlying-side finding above is more actionable and likely more fundamental.
+- **Verification:** new tests cover all three new counters directly (`_backfill_underlying` with a
+  pre-existing duplicate, with a candle missing its time field, and with candles spanning multiple
+  distinct days), plus confirmation that they flow through into `reconcile_underlying_gaps`'s
+  diagnostics dict. 191 tests total, all passing (2 skipped, unchanged).
+- **Explicitly unresolved:** this entry documents new tooling, not a fix. The actual cause of the
+  8002-vs-9 gap is still unknown; the next real report will narrow it down directly rather than through
+  further inference.
+- **Files:** `service/ingestion/backfill.py` (`_backfill_underlying`, `_report_to_markdown`),
+  `tests/test_backfill.py`.
+
+**[Post-Task 10 — the new diagnostics found the real cause on the very first use]** The user re-ran
+`gap-reconcile` and shared a fresh report with the new `skipped_existing`/`skipped_no_time_field`/
+`distinct_days_in_result` counters. This time the numbers fully explained themselves.
+- **What the report showed:** for all three tickers, `skipped_existing + skipped_no_time_field +
+  bars_written == event_count` exactly (e.g. SPX: 7985 + 0 + 17 = 8002) — every received event is
+  accounted for, `skipped_no_time_field` is 0 across the board (ruling out "most events aren't usable
+  candles"). The real signal was `distinct_days_in_result`: only 12-22 distinct calendar days
+  represented among ~8000 events, despite each request nominally spanning a ~43-day gap. `earliest_candle`
+  sat suspiciously exactly at `requested_start` (the same boundary-marker artifact noticed much earlier in
+  this investigation) rather than reflecting dense coverage of the old gap. The bulk of the real data was
+  concentrated in the *recent* ~2-3 weeks — which already existed in the DB (correctly, legitimately
+  deduplicated as `skipped_existing`) — while the actual old gap (e.g. SPX's July 6-13 stretch) got almost
+  nothing.
+- **Root cause:** `stop_on_repeated_key` (the fix from two entries above) is *too eager*. It was designed
+  around the confirmed, observed behavior that the live, in-progress candle gets re-broadcast with a
+  repeated `time` value — but this data shows that a large historical replay doesn't always deliver
+  cleanly old-to-new either; something in the *middle* of the replay can repeat a key before the
+  genuinely-final live-tail repeat ever arrives. An unconditional "first repeat ends collection" rule
+  stops right there, discarding all the older, still-undelivered history that a patient wait (as the
+  retention probe proved, before `stop_on_repeated_key` existed) would have eventually received.
+- **Fix: gate the repeat check on recency.** `collect_events` gained `repeat_key_min_value` — a repeated
+  key only ends collection if the key itself is at or above that threshold; a repeat of an older key is
+  recorded (so it won't spuriously retrigger later) but collection continues. `request_candles` computes
+  this as "within the last 5 minutes of wall-clock now," in the same raw-millisecond units as a candle's
+  own `time` field. Without this parameter (the default), behavior is unchanged — existing callers
+  (`snapshot_greeks`) are unaffected. This necessarily gives back some of the speed the unconditional
+  version bought — a request may again need to ride out more of `idle_timeout_s`/`timeout_s` for the
+  genuinely slow/throttled portions of a large replay — but returning correct, complete data was always
+  the actual goal; the earlier "catch up to live" attempt taught the same lesson once already (see two
+  entries above) and this is the same category of mistake, caught faster this time because the new
+  diagnostics made it directly visible instead of requiring another round of inference.
+- **The same-day `backfill` report showed 135 of 8802 option contracts hitting the same family of
+  truncation warning** ("earliest much later than expected") — this fix is unconditional across all
+  `request_candles` calls, not underlying-specific, so it should reduce that count too on the next run;
+  not independently confirmed yet.
+- **Verification:** new tests directly cover the recency gate — a repeat of an old key doesn't stop
+  collection (and real data received in between isn't lost), a repeat of a recent key does stop, the
+  ungated default behavior is unchanged, and a key that repeats multiple times while still below the
+  threshold doesn't misbehave. Plus a wiring test confirming `request_candles` computes the threshold
+  correctly (now − 5 minutes, in matching units). 196 tests total, all passing (2 skipped, unchanged).
+- **Files:** `service/sources/_async_utils.py` (`collect_events`), `service/sources/tastytrade.py`
+  (`request_candles`), `tests/test_async_utils.py`, `tests/test_tastytrade_source.py`.
+
+**[Post-Task 10 — the recency-gating fix worked exactly as intended, and that's what disproved the
+"stopping too early" theory]** The user re-ran `gap-reconcile` after the recency-gating fix and shared a
+new report.
+- **What changed vs. the previous run, and what didn't:** `elapsed_s` jumped from ~1-26s to ~646-670s for
+  all three tickers — direct confirmation the fix is doing what it was built to do: no longer stopping at
+  the first old-key repeat, patiently riding out far more of the stream. `event_count` grew too (e.g. SPX
+  8002 → 8649). But `distinct_days_in_result` stayed **exactly identical** across both runs (22, 19, 12)
+  despite ~650 extra seconds of genuine additional waiting. Whatever additional data arrived in that
+  extra time landed entirely within days already represented — not one single new distinct day was
+  gained.
+- **Conclusion: the client-side "stopping too early" theory is disproven, cleanly, by this comparison.**
+  If the earlier fix's problem were really about premature termination, riding out more of the stream
+  should have surfaced at least some previously-unreached older dates. It didn't. The server itself
+  is not delivering dense historical data for the old portion of these gaps, regardless of how long the
+  client waits — no further client-side timeout/detection tuning can fix that if it's true.
+- **This also means the original Task 0-era retention probe's conclusion likely needs revisiting.** That
+  probe (and its later underlying-specific follow-up) concluded "retention wall ≈ 43 days" by checking
+  whether *any* event appeared at a boundary date across several over-shooting requests — it never
+  checked *density*. A single boundary-marker event at the exact requested start (observed repeatedly
+  throughout this investigation, `earliest_candle` matching `requested_start` almost to the millisecond)
+  would produce exactly the same "convergence" signal the probe used as its evidence, without meaning
+  dense data actually exists from that point forward. Not confirmed yet either way — flagging this as a
+  real possibility rather than asserting it, since the probe's convergence-across-multiple-windows logic
+  is still reasonable evidence of *something* real at that boundary; it just may not mean what it was
+  taken to mean.
+- **Fix: added `candles_per_day` — a genuine per-calendar-day event count**, not just a distinct-day
+  presence check, to `_backfill_underlying`'s diagnostics (flows through `reconcile_underlying_gaps` and
+  both report formats same as the other counters). This is the first diagnostic in this investigation
+  that can directly distinguish "a handful of stray boundary-marker events on an old date" from "real,
+  dense, multi-hundred-event coverage of that date" — exactly the distinction `distinct_days_in_result`
+  couldn't make, which is what left this run's real explanation still open.
+- **Verification:** new tests confirm the per-day counts are accurate (a sparse single-event day vs. a
+  dense 50-event day, both counting identically toward `distinct_days_in_result` but very differently in
+  `candles_per_day`), that they flow into `reconcile_underlying_gaps`'s diagnostics, and that the
+  markdown formatter renders them per-ticker. 199 tests total, all passing (2 skipped, unchanged).
+- **Explicitly still unresolved:** whether the underlying data genuinely doesn't exist that far back
+  (a hard feed limitation, not fixable from this codebase) or whether something about *how* this
+  codebase's requests are shaped (the `tho=true` flag, the specific subscription mechanism, something
+  else) is suppressing it. The next report's `candles_per_day` breakdown should make this distinguishable
+  for the first time: a sharp cliff from near-zero to hundreds at a consistent date across all three
+  tickers would point to a real feed limitation; a gradual taper, or a limitation that varies
+  significantly by ticker, would point elsewhere.
+- **Files:** `service/ingestion/backfill.py` (`_backfill_underlying`, `_report_to_markdown`),
+  `tests/test_backfill.py`.
+
+**[Post-Task 10 — root cause found, conclusively, from the `candles_per_day` diagnostic's first real
+use]** The user re-ran `gap-reconcile` and shared a report with the new per-day density breakdown. This
+closes out the entire "why won't the gaps close" investigation with a definitive answer.
+- **What the report showed:** for all three tickers, `candles_per_day` had a single lone event at the
+  exact requested start date (the now-familiar boundary-marker artifact), then *nothing at all* for an
+  extended stretch, then a sharp jump straight to several hundred events/day, continuing densely all the
+  way to "now." The date of that jump differed per ticker: SPX ~27 calendar days before "now," NDX ~23,
+  VIX ~14. Multiplying each ticker's dense-window length by its own per-day rate (SPX 411/day, NDX
+  466/day, VIX 765/day) landed all three within roughly 7650-7950 total candles, despite the wildly
+  different calendar windows and per-day volumes (VIX's rate is ~2x SPX's).
+- **Conclusion: underlying candle retention is count-based (a roughly fixed number of trailing candles
+  per symbol, ~7600-7950), not date-based.** A higher-frequency symbol (VIX) burns through that budget in
+  fewer calendar days than a lower-frequency one (SPX), which is exactly the pattern observed. This is a
+  genuine, upstream data-availability characteristic of the feed — not a bug in this codebase, and not
+  fixable by any further client-side request tuning. Every fix made earlier in this investigation
+  (max_count/timeout_s, idle_timeout_s, `stop_on_repeated_key`, its recency-gating correction) was a real,
+  legitimate bug fix along the way — each one was independently verified to change behavior in the
+  expected direction — but none of them could have closed gaps this old, because the data genuinely no
+  longer exists server-side. The `candles_per_day` diagnostic (previous entry) is what finally made that
+  distinguishable from "still a client-side bug."
+- **This also reframes the original Task 0-era retention finding (~43 days) correctly**, as flagged as a
+  possibility in the previous entry: that finding almost certainly measured the same boundary-marker
+  artifact (an event existing at a far-back requested date) without checking density, which is a much
+  weaker signal than what `candles_per_day` now provides directly.
+- **Fix:** `RETENTION_DAYS` (`service/ingestion/gap_detection.py`) changed from `43` to `14` — the
+  shortest observed dense window (VIX), chosen conservatively since this codebase only models a single
+  day-count constant rather than true per-symbol, count-based retention; a higher-frequency symbol added
+  later could plausibly have an even shorter effective window. `DEFAULT_LOOKBACK_DAYS` (`backfill.py`,
+  governs normal backfill's *request* size, not gap-actionability) is unchanged at `60` — over-requesting
+  past real retention remains harmless for an ordinary fetch, per Task 0's original finding for option
+  contracts, which is a separate and still-valid result from the underlying-specific finding above.
+  `RETENTION_DAYS` is what actually needed correcting, since it's the one that determines whether a gap
+  gets treated as actionable (and endlessly re-attempted) vs. correctly recognized as permanently gone.
+- **Effect of the fix:** `/gaps` and `gap-reconcile` will now correctly flag gaps older than ~14 days as
+  `before_retention: true` / silently clip scan windows to that boundary, instead of treating a
+  permanently-unfillable multi-week stretch as an actionable gap forever. README.md's troubleshooting
+  section rewritten from an accumulated investigation trail into a clean, conclusive summary reflecting
+  this answer.
+- **Verification:** full test suite unaffected by the constant change (no test pinned the specific old
+  value; 199 tests, all passing, 2 skipped unchanged) — this entry is a data/constant change plus
+  documentation, not new code logic.
+- **Files:** `service/ingestion/gap_detection.py` (`RETENTION_DAYS`), `service/ingestion/backfill.py`
+  (`DEFAULT_LOOKBACK_DAYS` comment only), `service/api/routes.py` (`GET /gaps` docstring), `README.md`.
+
 **Template for new entries** (copy this when adding one):
 
 ```

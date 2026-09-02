@@ -102,6 +102,7 @@ class GapOut(BaseModel):
     start: datetime
     end: datetime
     minutes: int
+    before_retention: bool
 
 
 class GapsResponse(BaseModel):
@@ -113,6 +114,7 @@ class GapsResponse(BaseModel):
     ticker: str
     start: datetime
     end: datetime
+    retention_cutoff: datetime
     gaps: list[GapOut]
     gap_count: int
     total_missing_minutes: int
