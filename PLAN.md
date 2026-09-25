@@ -113,6 +113,73 @@ These were discussed and decided — do not revisit without good reason.
 - Whether daily-period (`1d`) candle history has its own depth cap independent of contract listing
   date — inconclusive from Task 0's short-dated test contracts. Not blocking; revisit only if deep
   daily history becomes a real need later.
+- **Should the ingestion pipeline self-heal on startup (2026-09-25, new)?** The 2026-09-25 hardening
+  fixed the defects that were silently losing live underlying data, but it did **not** add an automatic
+  reconcile-on-boot that would detect and backfill any residual gap in `underlying_bars_1m` from the
+  moment the service starts. The repo already has the machinery to do this (`gap_detection.py` +
+  `gap-reconcile` CLI), but wiring it to run automatically at pipeline startup is a new behavior with
+  real tradeoffs (an unexpected burst of API calls on every restart; a restart loop would re-request
+  repeatedly). **Recommendation: wire it in, but rate-limited and logged**, rather than leaving the
+  daily manual `backfill` as the safety net. **Not yet decided or implemented** — flagging it so a later
+  task picks it up rather than rediscovering the question.
+- ~~Is live underlying coverage now actually good?~~ **RESOLVED (2026-09-25, by production DB diagnostic):
+  yes, it is healthy — the gap that made daily manual `backfill` necessary was historical, not
+  ongoing.** Measured during regular trading hours (09:30–16:00 America/New_York) against production:
+  - Last 9 trading days: **NDX 3510/3510 = 100.00%**, **SPX 3510/3510 = 100.00%**,
+    **VIX 3501/3510 = 99.74%**.
+  - **Decomposition of the residual gap, 2026-08-03 → 2026-09-25 (40 weekdays). The headline is that
+    there is effectively no unexplained data loss inside the feed's retention window:**
+
+    | Ticker | Perfect days | Total missing | Labor Day | Today's outage | **Unexplained** |
+    |---|---|---|---|---|---|
+    | NDX | 38/40 | 413 | 388 | 25 | **0** |
+    | SPX | 38/40 | 391 | 388 | 3 | **0** |
+    | VIX | 4/40 * | 460 | 388 | 37 | **35** (all 34× the 09:30 minute) |
+
+    \* VIX shows only 4 perfect days purely because of the 09:30 item below, not because of scattered loss.
+
+    Every missing minute inside the window is accounted for by one of three causes, and **none of them
+    is a live-ingestion bug:**
+    1. **2026-09-07 is Labor Day** — 388 minutes × 3 tickers. The feed is closed; the only row present is
+       one stray 09:30 quote. This is a *measurement artifact*: the weekday-only expected-series filter
+       counts holidays as trading days. It is not missing data and should not be backfilled. Worth
+       remembering that a naive `extract(isodow) < 6` "trading day" definition overstates gaps by
+       ~390 min/holiday/ticker; the project has no market-calendar table, so ad-hoc coverage queries
+       need to exclude holidays explicitly.
+    2. **2026-09-25, 12:49–13:36 ET — the `sqlalchemy[asyncio]`/greenlet outage** documented in the
+       Section 7 entry below. Timestamps match the image rebuild (12:44 ET) to the restart (13:36 ET)
+       exactly. Self-inflicted and already fixed. The `backfill` container running during this
+       diagnostic is actively filling it: SPX went from 37 missing to 3 during the session, which also
+       demonstrates the recovery path works for in-retention gaps.
+    3. **VIX has no 09:30 bar, on essentially every day** (34 of 38). This is *correct behavior, not
+       loss*: VIX's first regular-hours bar is 09:31 on every day checked. The feed simply does not
+       quote during the 09:30 minute, and the aggregator deliberately does **not** forward-fill a minute
+       with no events (see "Sparse data handling" in Task 4). Fabricating that minute would mean
+       inventing a price the index never printed.
+  - The loss is all in **June and July 2026**: June has 2 days / 6 bars total; July averages
+    ~276 bars/day for SPX against 390 expected, and VIX covers only 12 of 21 days. August onward is
+    complete.
+  - June 25 (the very first row in the table) is ~62 trading days back and July 31 ~38 trading days
+    back, both well outside the ~7,600–7,950-candle count-based retention already documented in the
+    Section 7 retention entry. **That history is very likely permanently unfillable** — worth one
+    confirmation run before writing it off entirely, but do not expect `backfill` to recover it.
+  - **Correction to an earlier assumption of mine:** the natural way to split live rows from
+    backfilled rows (live = `volume IS NULL`, backfilled = volume populated) **does not work for this
+    table.** Every row in `underlying_bars_1m` has `volume IS NULL`, including rows written by
+    `backfill`, because the feed returns `'NaN'` in the volume position for SPX/NDX/VIX candles
+    (observed directly in the backfill container's candle stream). Provenance cannot be inferred from
+    `volume`; the coverage measurements above are therefore stated as coverage, deliberately *not* as
+    live-vs-backfill provenance. The 221-test suite passed throughout because nothing depends on this
+    assumption.
+  - **Backtest-relevant gotcha, now known:** the VIX series has no 09:30 bar, and VIX sessions are
+    irregular in general. Any consumer that assumes one bar per minute, or that indexes the opening
+    minute positionally (e.g. `bars[0]` as "the 09:30 bar"), will be wrong for VIX. Consumers should
+    key off timestamps and tolerate absent minutes rather than assuming a dense grid. This is a
+    property of the feed, not a defect to fix.
+  - **Practical consequence:** the daily manual `backfill` is no longer needed to maintain underlying
+    coverage going forward, and cannot recover June/July. The only in-retention gap it could still
+    repair is a self-inflicted outage (as on 2026-09-25), which the startup self-heal question above
+    would handle automatically.
 - ~~Auth model for TastyTrade (username/password session vs OAuth2)~~ **RESOLVED (discovered during
   Task 0):** TastyTrade discontinued username/password session-token authentication on December 1,
   2025. OAuth2 (client_secret + refresh_token) is now the only option, so this isn't a choice to make
@@ -292,9 +359,10 @@ first pass, not a settled decision.
 ---
 
 ### Task 4 — Live Ingestion Pipeline (Streaming → 1m Bars → DB)
-**Status:** DONE (2026-07-18)
+**Status:** DONE (2026-07-18) — **revisited and hardened 2026-09-25 after a live-data investigation (see below)**
 
 **What was delivered:**
+**
 - `service/ingestion/bar_aggregator.py` — `BarAggregator`: buckets Quote/Greeks events into 1-minute
   OHLC(+Greeks) bars, keyed by (key, minute-epoch) where `key` is agnostic to whether it's an option
   `contract_id` or an underlying ticker. `pop_ready(now)` returns and removes buckets whose minute has
@@ -343,6 +411,49 @@ subscribing to `Trade` events, not currently in scope).
 TastyTrade + a live market to fully close this out.
 
 **Deliverables:** all files above, part of the same `options-data-service` repo bundle.
+
+**Post-deployment hardening (2026-09-25):** a live-data investigation found that live underlying
+bars were largely absent from `underlying_bars_1m`, which is what had been making a daily manual
+`backfill` look necessary. Five distinct defects in the delivered pipeline turned out to be capable of
+causing that, all now fixed and all logged individually in **Section 7**:
+1. Underlying quotes were subscribed using the raw config ticker (`SPX`) rather than the feed's own
+   symbol for that instrument, resolved authoritatively via `Equity.streamer_symbol`.
+2. `pop_ready()` is destructive, and its result was never restored on write failure — a failed flush
+   **permanently discarded** those bars. (The log message claiming the next cycle would retry them was
+   simply untrue; the `restore()` fix makes it true.)
+3. Option and underlying bars shared one transaction, so any failure in the high-volume option path
+   rolled back the underlying bars batched alongside it.
+4. The live path used a bare `session.add()`, so an overlapping `backfill` run writing the same
+   `(time, identifier)` key turned a live flush into an `IntegrityError`.
+5. NaN values (both `float` and `Decimal`) from the feed passed through as valid prices/Greeks, and a
+   single NaN poisons an entire bar via `min()`/`max()` in ways that are invisible in the output.
+
+Also fixed alongside: a pre-existing Windows-only crash in the backfill report writer (implicit `cp1252`
+encoding on a non-ASCII report line), and a self-inflicted `merge_older()` bug found while reviewing
+the new restore path (see its Section 7 entry).
+
+**Not fixed, and deliberately so:** live underlying coverage is still bounded by how often the feed
+actually quotes the instrument — live aggregation intentionally does *not* carry forward minutes with no
+events (see "Sparse data handling" above), so a quiet index will still produce a structurally sparse 1m
+series. This change set makes the pipeline correct and observable, not complete. No automatic
+startup catch-up / self-healing reconciler was added; that remains an open decision, not an oversight
+(see Section 4).
+
+**Production diagnostic (2026-09-25, run after these fixes): live ingestion is confirmed healthy.**
+Measured during regular trading hours against production: last 9 trading days are 100.00% / 100.00% /
+99.74% covered for NDX / SPX / VIX, and the last 40 trading days sit at ~97% for all three. The missing
+underlying data that motivated this whole investigation is confined to **June–July 2026** and is, per
+the existing count-based retention finding, most likely unrecoverable rather than a live bug. Notably,
+this means the five defects fixed here were **real but were not the cause of the observed gap** — they
+were latent data-loss paths (silent discard on write failure, shared-transaction rollback,
+non-idempotent insert, NaN corruption, wrong-symbol subscription) rather than an active cause of the
+June–July hole. Fixed anyway, on the grounds that each is a genuine way to lose data. Full numbers, plus
+a correction to the `volume`-as-provenance assumption, are in Section 4.
+
+**Verification:** 221 tests pass (8 skipped without a Postgres instance). The 8 skips are the two
+opt-in real-Postgres files, which were run and passed against a live `postgres:16-alpine` container
+during this session — including a full `IngestionPipeline` flush against real Postgres, which is what
+caught the enum-serialization and FK-target assumptions that SQLite structurally cannot check.
 
 ---
 
@@ -1798,6 +1909,189 @@ closes out the entire "why won't the gaps close" investigation with a definitive
   documentation, not new code logic.
 - **Files:** `service/ingestion/gap_detection.py` (`RETENTION_DAYS`), `service/ingestion/backfill.py`
   (`DEFAULT_LOOKBACK_DAYS` comment only), `service/api/routes.py` (`GET /gaps` docstring), `README.md`.
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** Live underlying bars were almost entirely absent
+from `underlying_bars_1m`, which is what had been making a daily manual `backfill` look necessary.
+Five independent defects, each logged separately below, were all capable of causing it. This entry is
+the umbrella; read the five that follow as one investigation.
+- **Symptom:** `underlying_bars_1m` showed almost no rows for recent sessions. No error, no warning, no
+  exception anywhere in the logs. The pipeline looked healthy.
+- **Root cause:** not one cause — see below. The shared theme is that **every one of these failed
+  silently**, which is what made the problem so hard to localize from the outside.
+- **Fix:** see the five entries below.
+- **Files:** `service/ingestion/pipeline.py`, `service/ingestion/bar_aggregator.py`,
+  `service/sources/_async_utils.py`, `service/sources/base.py`, `service/sources/tastytrade.py`,
+  `service/db/upsert.py`.
+- **General lesson:** in an ingestion pipeline, the failure modes worth testing for first are the ones
+  that produce *no error*: silently-wrong symbols, silently-discarded buffers, silently-rolled-back
+  transactions, silently-skipped rows, and silently-corrupt values. An exception would have been a
+  kindness.
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** Underlying quotes were subscribed using the raw
+config ticker rather than the feed's own symbol for that instrument.
+- **Symptom:** essentially no live underlying bars, with no error — see the umbrella entry above.
+- **Root cause:** the pipeline called `source.subscribe_quotes([...config tickers...])`. But a value
+  like `SPX` is an *option-chain underlying code*, which is not necessarily what the streaming feed
+  calls that instrument; indices in particular use a different convention on DXLink. Subscribing to a
+  symbol the feed doesn't recognize produces **no error and no data** — the exact combination that's
+  indistinguishable from a quiet market.
+- **Fix:** added `MarketDataSource.get_underlying_streamer_symbol(ticker)`. The TastyTrade implementation
+  resolves it authoritatively from the instruments API (`Equity.get(session, ticker).streamer_symbol`),
+  falling back to the input ticker on any failure — the fallback makes this strictly no worse than the
+  old behavior, so there's no new failure mode. The pipeline now keeps **two** maps: config-ticker →
+  feed-symbol (for subscribing) and feed-symbol → config-ticker (for routing incoming events), and DB
+  rows are still keyed by the config ticker, since that's what the API and backfill both speak in.
+- **Files:** `service/sources/base.py` (new interface method), `service/sources/tastytrade.py`
+  (implementation), `service/ingestion/pipeline.py` (resolution + routing), `tests/test_pipeline.py`,
+  `tests/test_tastytrade_source.py`.
+- **General lesson:** in any data provider API, distinguish "the identifier your users/config use" from
+  "the identifier the vendor's feed expects," and never assume they're the same string. **Caveat, now
+  settled by evidence (2026-09-25 diagnostic):** this was **not** the cause of the missing underlying
+  data. Live logs show the feed delivering bare `SPX` and `NDX` Quote events under exactly those
+  symbols, so the identity mapping is correct for these instruments and `get_underlying_streamer_symbol()`
+  resolves them to themselves. RTH coverage is ~100%. The fix is kept because it is cheap, strictly
+  safe (the fallback can only return the input ticker), and genuinely protects against a future
+  instrument whose feed symbol *does* differ — but it should not be credited with solving the original
+  problem. Worth remembering how this was settled: the theory looked plausible for a long time and only
+  fell to a direct measurement of the actual event stream.
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** A failed flush permanently discarded the bars it
+had already popped out of memory.
+- **Symptom:** occasional small, irrecoverable holes in bar data that no retry could fill, requiring a
+  manual `backfill` to repair.
+- **Root cause:** `BarAggregator.pop_ready()` *removes* buckets as it returns them, and the caller
+  popped them before attempting the write. On failure they were simply gone. Nothing re-creates a
+  bucket for a minute that has already elapsed — only a live event for that exact minute does that — so
+  the data was unrecoverable by any later flush. Worse, the error log for this path stated the next
+  cycle would retry, which was **untrue**; the log actively misdirected debugging toward a retry
+  mechanism that didn't exist.
+- **Fix:** added `BarAggregator.restore(ready)`, called on write failure. If a bucket for the same
+  (key, minute) started accumulating again while the failed write was in flight (possible — awaiting
+  yields control, and more events can arrive), the two are merged rather than one clobbering the other.
+  The log message is now accurate.
+- **Files:** `service/ingestion/bar_aggregator.py` (`restore()`), `service/ingestion/pipeline.py`
+  (restore-on-failure), `tests/test_bar_aggregator.py`, `tests/test_pipeline.py`.
+- **General lesson:** a remove-then-write loop needs an explicit compensating action, and an error
+  message that describes a recovery that doesn't exist is worse than no message at all — it stops the
+  next person from looking for the real cause.
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** Option and underlying bars shared one transaction,
+so option-path failures rolled back underlying bars batched with them.
+- **Symptom:** underlying bars missing specifically on cycles where the option path had trouble, with
+  no obvious correlation in the logs.
+- **Root cause:** one session and one `commit()` for both. The option path is by far the larger and
+  higher-churn one (hundreds of contracts per flush) and therefore the one more likely to fail — so the
+  handful of underlying bars riding in the same batch were being sacrificed as collateral damage to an
+  unrelated problem, repeatedly.
+- **Fix:** separate sessions, separate commits, separate error handling. A failure in the option write
+  no longer prevents the underlying write, and each is restored independently.
+- **Files:** `service/ingestion/pipeline.py` (`_write_option_bars` / `_write_underlying_bars`),
+  `tests/test_pipeline.py`.
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** Live insert was not idempotent, so an overlapping
+`backfill` run turned a live flush into an `IntegrityError`.
+- **Symptom:** intermittent flush failures that correlated with running `backfill` around the same time.
+- **Root cause:** live ingestion used a bare `session.add()`, which raises on a primary-key collision.
+  Both writers target the same `(time, identifier)` rows, and backfill's own convention was to
+  *check-then-skip* — so the two writers disagreed about what a duplicate means. Combined with the
+  destructive `pop_ready()` above, one overlapping backfill could cost a minute of live data outright.
+- **Fix:** new `service/db/upsert.py::insert_ignore()`, dispatching to the Postgres or SQLite
+  `insert().on_conflict_do_nothing()`. Both dialects are implemented deliberately: the suite runs on
+  SQLite while production runs on Postgres, so a Postgres-only implementation would have left the
+  conflict handling itself untested. Unknown dialects fall back to plain inserts (correct, but not
+  conflict-tolerant), with a debug log saying so.
+- **Files:** `service/db/upsert.py` (new), `service/ingestion/pipeline.py`,
+  `tests/test_upsert_postgres.py` (new), `tests/test_pipeline.py`.
+- **General lesson:** if two independent writers can target the same key, the *upsert semantics* are part
+  of the contract between them, not an implementation detail of each. Also worth knowing: SQLAlchemy has
+  no backend-agnostic upsert, so any such helper is dialect-specific by nature and needs a test per
+  dialect you support.
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** NaN values from the feed passed through as valid
+prices and Greeks, silently corrupting whole bars.
+- **Symptom:** occasional bars with `NaN` OHLC, or — worse — plausible-looking but wrong `high`/`low`.
+- **Root cause:** the feed does emit NaN, and both `float('nan')` and `Decimal('NaN')` pass the usual
+  `is not None` checks. Because a bucket's `high`/`low` are computed with `max()`/`min()` across every
+  event in the minute, a **single** NaN propagates through the whole bar. A NaN reaching a `Numeric`
+  column is silently corrupt data, not a loud failure.
+- **Fix:** `is_nan()` in `service/sources/_async_utils.py`, applied in `get_attr_any()` (so NaN is
+  filtered on the way in) and again in `BarAggregator._mark()` as a second line of defense at the single
+  choke point every price passes through. Handles `Decimal` NaN as well as `float` NaN — a
+  float-only check would have missed one of the two.
+- **Files:** `service/sources/_async_utils.py`, `service/ingestion/bar_aggregator.py`,
+  `tests/test_bar_aggregator.py`.
+- **General lesson:** `x is not None` is not a validity check. If a numeric value from an external
+  source can be NaN or infinite, say so explicitly, and put the guard at the boundary *and* at the
+  point of use.
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** A Windows-only crash in the backfill report writer
+(found incidentally, not part of the underlying investigation).
+- **Symptom:** `UnicodeEncodeError: 'charmap' codec can't encode character` when writing the backfill
+  JSON report, on Windows only. Reproduced by an existing test the moment it ran on a Windows dev box.
+- **Root cause:** `Path.write_text()` without an explicit `encoding=` uses the platform default, which
+  is `cp1252` on Windows. The report legitimately contains non-ASCII characters (currency symbols in
+  the coverage summary).
+- **Fix:** explicit `encoding="utf-8"` on every report write.
+- **Files:** `service/ingestion/backfill.py`.
+- **General lesson:** never rely on the platform default encoding for a file that gets written rather
+  than read. This is the second time in this project's history that a platform-default assumption has
+  produced a Windows-only failure (see the Task 1 port-collision entry for the other category).
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** Self-inflicted: `Bucket.merge_older()` used `min()`
+to pick the merged bar's `open`.
+- **Symptom:** none in production — caught by review while writing tests for the new `restore()` path.
+- **Root cause:** `open` is the *first observed* price of the minute, not the minimum, so the older
+  bucket's value must win outright. Folding it in with `min()` the way `high`/`low` are folded in is
+  wrong for every minute that trades *down*. The existing test only covered a rising minute
+  (100 → 120), where `min()` coincidentally produces the right answer — the classic bug that a single
+  happy-path test cannot see.
+- **Fix:** `self.open = older.open`, unconditionally. Added a falling-price test (120 → 100) as the
+  companion case, and confirmed it fails against the old code before keeping it.
+- **Files:** `service/ingestion/bar_aggregator.py`, `tests/test_bar_aggregator.py`.
+- **General lesson:** when writing the fix for a merge, check whether the existing test only exercises
+  one direction of the thing being merged. `min`/`max` are correct for `high`/`low` and wrong for
+  `open`/`close`, and no amount of staring at the code reveals that as clearly as the mirrored test does.
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** Test-infrastructure gotcha (no product impact): a
+failing opt-in Postgres test left its schema behind and broke every *other* test in the file.
+- **Symptom:** 6 errors, none of them in the test that actually failed — all of them a
+  `DuplicateObjectError: type "option_right" already exists` from the shared fixture's setup.
+- **Root cause:** teardown lived in the test body rather than a `finally`, so a failure skipped it. The
+  next run's setup then tried `DROP TYPE` while a leftover table still depended on it, that `DROP`
+  failed, and the `CREATE TYPE` immediately after collided. A single real failure thus cascaded across
+  the whole file and pointed the reader at entirely the wrong thing.
+- **Fix:** `DROP ... CASCADE` on all drops in both setup and teardown, so cleanup is blunt and
+  unconditional rather than order-dependent.
+- **Files:** `tests/test_upsert_postgres.py`.
+- **General lesson:** in any opt-in integration-test file, schema teardown must be unconditional and must
+  not depend on the test body reaching the end. More broadly — when one test in a file fails, check
+  whether the *other* failures are real or just fallout before debugging them.
+
+**[Task 4 — post-deployment hardening, 2026-09-25]** `requirements.txt` never declared SQLAlchemy's
+`[asyncio]` extra, so a fresh image build produced an image where every service crash-looped on startup.
+- **Symptom:** `api` and `ingestion` containers in a `Restarting (1)` loop; nothing listening on
+  port 8000; `curl localhost:8000/metadata` returned nothing at all. The database was healthy and
+  `migrate` exited 0, so the failure looked application-specific. Actual error:
+  `ImportError: The SQLAlchemy asyncio module requires that the Python 'greenlet' library is installed`
+  raised from `service/api/routes.py:16` — a pre-existing import line, not new code.
+- **Root cause:** `requirements.txt` said `sqlalchemy>=2.0.36` with no extra. SQLAlchemy's async
+  support needs `greenlet`. In **2.0.x, greenlet was a base dependency**, so the missing extra was
+  harmless in practice; in **2.1.x it is available only via the `asyncio` extra** (verified:
+  `Requires-Dist: greenlet>=1; extra == "asyncio"`, and no unconditional greenlet requirement). The
+  unpinned `>=` therefore meant this sat dormant until the next rebuild: the last-known-good image had
+  SQLAlchemy 2.0.52 + greenlet 3.5.5, and a rebuild on 2026-09-25 resolved 2.1.1 + **no greenlet**.
+  Local dev was unaffected the whole time because the local environment had been installed with the
+  extra, or before 2.1 existed.
+- **Fix:** `sqlalchemy[asyncio]>=2.0.36` in `requirements.txt`, with a comment explaining why the extra
+  is load-bearing. Rebuilt and verified: `greenlet` present, `sqlalchemy.ext.asyncio` imports, both
+  containers healthy, `/metadata` returns 200.
+- **Files:** `requirements.txt`.
+- **General lesson:** an unbounded `>=` on a dependency whose transitive/optional-dependency behavior
+  changed is a latent outage, and **it will not show up in tests** — the local venv and the image are
+  two different dependency resolutions. The tell was structural: a *base* requirement that the library
+  itself documents as needed only for async use. Declare the extra you actually rely on rather than
+  relying on it arriving transitively; when a rebuild-first-good-service-second failure appears, check
+  the image's package versions against the last-known-good image *before* reading application code.
 
 **Template for new entries** (copy this when adding one):
 

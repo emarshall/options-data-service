@@ -37,6 +37,24 @@ class MarketDataSource(ABC):
         ...
 
     @abstractmethod
+    async def get_underlying_streamer_symbol(self, ticker: str) -> str:
+        """Return the feed-native subscription symbol for `ticker`'s own
+        quotes.
+
+        Added after finding that the ingestion pipeline was subscribing to
+        live underlying quotes using the raw config ticker (e.g. `SPX`)
+        and getting little or nothing back. That string is a *chain
+        underlying code*, not necessarily the symbol the streaming feed
+        recognizes — feeds generally use a different convention for the
+        same instrument (e.g. a slash-prefixed form for indices). Every
+        source is expected to expose the mapping explicitly rather than
+        have callers guess at it; implementations should return the
+        input unchanged if the feed genuinely uses the same string, so
+        this is always safe to call.
+        """
+        ...
+
+    @abstractmethod
     async def subscribe_quotes(
         self, symbols: list[str], callback: Callable[[Any], Awaitable[None]]
     ) -> None:

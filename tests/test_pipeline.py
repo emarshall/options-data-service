@@ -6,6 +6,7 @@ bucket-flush timing is deterministic instead of needing to sleep real
 wall-clock seconds.
 """
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
@@ -54,6 +55,10 @@ class FakeSource:
         self.quote_symbols: set[str] = set()
         self.greeks_symbols: set[str] = set()
         self.unsubscribed: list[str] = []
+        # Config ticker -> feed-native symbol, for exercising the case
+        # where the two genuinely differ (e.g. an index). Defaults to
+        # identity, which is what most instruments do.
+        self.streamer_symbols: dict[str, str] = {}
 
     async def authenticate(self):
         pass
@@ -63,6 +68,9 @@ class FakeSource:
 
     async def get_option_chain(self, ticker):
         return self.chains.get(ticker, {})
+
+    async def get_underlying_streamer_symbol(self, ticker):
+        return self.streamer_symbols.get(ticker, ticker)
 
     async def snapshot_greeks(self, symbols, timeout_s):
         return {
@@ -368,3 +376,224 @@ def test_explicit_constructor_args_override_settings():
     )
     assert pipeline._contract_refresh_interval_s == 999.0
     assert pipeline._contract_refresh_fast_interval_s == 1.0
+
+
+# --- Underlying feed-symbol resolution ---
+#
+# The config ticker (e.g. "SPX") is a chain underlying code; the feed may
+# stream the same instrument under a different symbol. Subscribing with the
+# config ticker produced little or no live underlying data, so the real
+# mapping is now resolved explicitly and used for subscribing, while rows
+# are still keyed by the config ticker.
+
+
+@pytest.mark.asyncio
+async def test_underlying_subscribes_under_feed_symbol_not_config_ticker(db_session_factory, clock):
+    source = FakeSource()
+    source.streamer_symbols = {"SPX": "/SPX"}  # feed uses the index convention
+    exp = date.today() + timedelta(days=3)
+    source.chains["SPX"] = {exp: [FakeOption(".SPX_C500", exp, 500.0, "C")]}
+    source.greeks_snapshot = {".SPX_C500": 0.5}
+    settings = AppConfig(tickers=[TickerConfig(ticker="SPX", capture_underlying_bars=True)])
+
+    pipeline = IngestionPipeline(source, db_session_factory, settings, clock=clock)
+    await pipeline._refresh_and_subscribe()
+
+    assert "/SPX" in source.quote_symbols, "should subscribe using the feed-native symbol"
+    assert "SPX" not in source.quote_symbols, "config ticker is not the subscription symbol"
+    assert ".SPX_C500" in source.quote_symbols, "option contracts still subscribe normally"
+
+
+@pytest.mark.asyncio
+async def test_underlying_quote_routed_from_feed_symbol_to_config_ticker(db_session_factory, clock):
+    """The event comes back tagged with the *feed* symbol, but the row has
+    to be keyed by the *config* ticker — that's what the API and backfill
+    speak in."""
+    source = FakeSource()
+    source.streamer_symbols = {"SPX": "/SPX"}
+    settings = AppConfig(tickers=[TickerConfig(ticker="SPX", capture_underlying_bars=True)])
+
+    pipeline = IngestionPipeline(source, db_session_factory, settings, clock=clock)
+    await pipeline._refresh_and_subscribe()
+    await source.emit_quote("/SPX", bid=6500.0, ask=6500.4)
+
+    clock.advance(70)
+    await pipeline._flush_ready_bars()
+
+    async with db_session_factory() as session:
+        rows = (await session.execute(select(UnderlyingBar1m))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].ticker == "SPX"
+        assert float(rows[0].close) == 6500.2
+
+
+@pytest.mark.asyncio
+async def test_underlying_symbol_lookup_failure_falls_back_to_config_ticker(db_session_factory, clock):
+    """A failed lookup must never block startup or subscribe to something
+    wrong — it degrades to exactly the previous behavior."""
+
+    class BrokenSource(FakeSource):
+        async def get_underlying_streamer_symbol(self, ticker):
+            raise RuntimeError("instruments API down")
+
+    source = BrokenSource()
+    settings = AppConfig(tickers=[TickerConfig(ticker="SPX", capture_underlying_bars=True)])
+
+    pipeline = IngestionPipeline(source, db_session_factory, settings, clock=clock)
+    await pipeline._refresh_and_subscribe()
+
+    assert "SPX" in source.quote_symbols
+
+
+# --- Write-failure handling: bars must not be lost, and must be isolated ---
+
+
+class _CommitProxy:
+    """Delegates everything to a real session, but lets commit() be made
+    to fail on demand. Deliberately wraps the *real* session rather than
+    mocking the DB away, so everything up to and including the insert still
+    behaves exactly as in production."""
+
+    def __init__(self, session, owner):
+        self._session = session
+        self._owner = owner
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    async def commit(self):
+        self._owner.commit_attempts += 1
+        if self._owner.fail_next_commit:
+            self._owner.fail_next_commit = False
+            raise RuntimeError("simulated commit failure")
+        await self._session.commit()
+
+
+class CommitControllableSessionFactory:
+    def __init__(self, factory):
+        self._factory = factory
+        self.fail_next_commit = False
+        self.commit_attempts = 0
+
+    def __call__(self):
+        return self._ctx()
+
+    @asynccontextmanager
+    async def _ctx(self):
+        async with self._factory() as session:
+            yield _CommitProxy(session, self)
+
+
+@pytest.mark.asyncio
+async def test_failed_option_flush_keeps_bars_for_retry(db_session_factory, clock):
+    """Before the fix, pop_ready() removed the buckets before the write,
+    so a failed commit discarded them permanently — the log even claimed
+    the next interval would retry, which it never did."""
+    source, pipeline = await _setup_pipeline(db_session_factory, clock)
+    controllable = CommitControllableSessionFactory(db_session_factory)
+    pipeline._session_factory = controllable
+
+    await source.emit_quote("SPY_C450", bid=1.0, ask=1.2)
+    clock.advance(70)
+    controllable.fail_next_commit = True
+    await pipeline._flush_ready_bars()
+
+    # Nothing written, but the bar is back in the aggregator.
+    async with db_session_factory() as session:
+        assert (await session.execute(select(OptionBar1m))).scalars().all() == []
+    assert pipeline._option_bars.pending_count() == 1
+
+    # Next cycle writes it for real.
+    await pipeline._flush_ready_bars()
+    async with db_session_factory() as session:
+        rows = (await session.execute(select(OptionBar1m))).scalars().all()
+        assert len(rows) == 1
+        assert float(rows[0].close) == 1.1
+    assert pipeline._option_bars.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_underlying_flush_keeps_bars_for_retry(db_session_factory, clock):
+    source, pipeline = await _setup_pipeline(db_session_factory, clock)
+    controllable = CommitControllableSessionFactory(db_session_factory)
+    pipeline._session_factory = controllable
+
+    await source.emit_quote("SPY", bid=440.0, ask=440.2)
+    clock.advance(70)
+    controllable.fail_next_commit = True
+    await pipeline._flush_ready_bars()
+
+    async with db_session_factory() as session:
+        assert (await session.execute(select(UnderlyingBar1m))).scalars().all() == []
+    assert pipeline._underlying_bars.pending_count() == 1
+
+    await pipeline._flush_ready_bars()
+    async with db_session_factory() as session:
+        assert len((await session.execute(select(UnderlyingBar1m))).scalars().all()) == 1
+    assert pipeline._underlying_bars.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_option_write_failure_does_not_drop_underlying_bars(db_session_factory, clock):
+    """Options and underlyings used to share one transaction, so a failure
+    in the high-volume option path rolled back the underlying bars in the
+    same flush too. They now fail independently."""
+    source, pipeline = await _setup_pipeline(db_session_factory, clock)
+    controllable = CommitControllableSessionFactory(db_session_factory)
+    pipeline._session_factory = controllable
+
+    await source.emit_quote("SPY_C450", bid=1.0, ask=1.2)
+    await source.emit_quote("SPY", bid=440.0, ask=440.2)
+    clock.advance(70)
+    controllable.fail_next_commit = True  # hits the option write only
+    await pipeline._flush_ready_bars()
+
+    async with db_session_factory() as session:
+        assert (await session.execute(select(OptionBar1m))).scalars().all() == []
+        underlying = (await session.execute(select(UnderlyingBar1m))).scalars().all()
+        assert len(underlying) == 1, "underlying bar must survive the option failure"
+        assert float(underlying[0].close) == 440.1
+    # And the option bar is queued for retry, not lost.
+    assert pipeline._option_bars.pending_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_underlying_flush_skips_row_that_already_exists(db_session_factory, clock):
+    """Backfill and live ingestion write the same (time, ticker) rows. A
+    plain INSERT would raise IntegrityError on overlap and take the whole
+    flush down with it; the live path is conflict-tolerant instead."""
+    source, pipeline = await _setup_pipeline(db_session_factory, clock)
+
+    # Work out the bar's minute from the clock *before* advancing it —
+    # the quote lands in the current minute, not the one we advance into.
+    minute = int(clock().timestamp() // 60 * 60)
+    bar_time = datetime.fromtimestamp(minute, tz=timezone.utc)
+    await source.emit_quote("SPY", bid=440.0, ask=440.2)
+    clock.advance(70)
+
+    # Simulate backfill having already written this exact minute.
+    async with db_session_factory() as session:
+        session.add(UnderlyingBar1m(time=bar_time, ticker="SPY", close=999.0, volume=1234))
+        await session.commit()
+
+    await pipeline._flush_ready_bars()  # must not raise
+
+    async with db_session_factory() as session:
+        rows = (await session.execute(select(UnderlyingBar1m))).scalars().all()
+        assert len(rows) == 1
+        assert float(rows[0].close) == 999.0, "existing row left untouched"
+    assert pipeline._underlying_bars.pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_quote_events_are_counted_by_class(db_session_factory, clock):
+    """The counters that make a silently-dead underlying subscription
+    visible: a symbol the feed doesn't recognize produces no events and no
+    error, which is otherwise indistinguishable from a quiet market."""
+    source, pipeline = await _setup_pipeline(db_session_factory, clock)
+
+    await source.emit_quote("SPY", bid=440.0, ask=440.2)
+    await source.emit_quote("SPY_C450", bid=1.0, ask=1.2)
+    await source.emit_quote("SPY_C450", bid=1.1, ask=1.3)
+
+    assert pipeline._quote_events == {"underlying": 1, "option": 2}

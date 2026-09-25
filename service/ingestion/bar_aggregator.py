@@ -26,6 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from service.sources._async_utils import is_nan
+
 
 @dataclass
 class Bucket:
@@ -52,6 +54,46 @@ class Bucket:
         self.bid = bid
         self.ask = ask
 
+    def merge_older(self, older: "Bucket") -> None:
+        """Folds a bucket covering *earlier* data for the same minute into
+        this one, preserving correct OHLC semantics.
+
+        Only called from `restore()`, where the direction is always fixed:
+        the bucket being restored was popped before this one started
+        accumulating, so `self` is the newer of the two. That matters —
+        `self`'s close/bid/ask and its Greeks snapshot are the later
+        observations and must win, while the open and the high/low
+        extremes have to still account for the older data or the bar would
+        silently understate its own range.
+
+        Overwriting either bucket outright instead of merging would
+        silently discard real observed data on one side or the other.
+        """
+        # `open` is the *first observed* price, not the minimum — so the
+        # older bucket's value wins outright. It must not be folded in with
+        # min()/max() the way high/low are: a bar whose first tick was 120
+        # and whose later ticks fell to 100 opens at 120, and a min() here
+        # would silently report 100.
+        if older.open is not None:
+            self.open = older.open
+        if older.high is not None:
+            self.high = older.high if self.high is None else max(self.high, older.high)
+        if older.low is not None:
+            self.low = older.low if self.low is None else min(self.low, older.low)
+        # Close/bid/ask: this bucket's own values are the later ones and
+        # win; only fall back to the older bucket if we have none at all.
+        if self.close is None:
+            self.close = older.close
+        if self.bid is None:
+            self.bid = older.bid
+        if self.ask is None:
+            self.ask = older.ask
+        # Greeks: same reasoning — ours is the newer snapshot.
+        if not self.has_greeks and older.has_greeks:
+            self.delta, self.gamma, self.theta = older.delta, older.gamma, older.theta
+            self.vega, self.rho, self.iv = older.vega, older.rho, older.iv
+            self.has_greeks = True
+
     def update_greeks(self, delta, gamma, theta, vega, rho, iv) -> None:
         self.delta, self.gamma, self.theta, self.vega, self.rho, self.iv = delta, gamma, theta, vega, rho, iv
         self.has_greeks = True
@@ -75,7 +117,17 @@ class BarAggregator:
         """Mark = bid/ask midpoint. Falls back to whichever side is
         present if only one is — e.g. deep OTM contracts sometimes quote
         one-sided. Returns None if neither side is present (nothing to
-        record)."""
+        record).
+
+        NaN is normalized to None here as a second line of defense —
+        `get_attr_any` already filters NaN on the way in, but this is the
+        single choke point every price passes through, and a NaN reaching
+        a `Numeric` column is silently corrupt rather than loudly wrong.
+        """
+        if is_nan(bid):
+            bid = None
+        if is_nan(ask):
+            ask = None
         if bid is not None and ask is not None:
             return (bid + ask) / 2
         return bid if bid is not None else ask
@@ -108,6 +160,31 @@ class BarAggregator:
             if now_ts >= minute + 60 + self._flush_grace_seconds:
                 ready.append((k[0], k[1], self._buckets.pop(k)))
         return ready
+
+    def restore(self, ready: list[tuple[str, int, Bucket]]) -> None:
+        """Puts buckets previously returned by `pop_ready()` back into
+        memory, for use when writing them out failed.
+
+        Without this, `pop_ready()`'s removal is destructive and
+        unrecoverable: a failed commit would discard those bars entirely
+        and nothing would ever re-emit them, because the only thing that
+        creates a bucket is a live event for that exact minute — which
+        will not come again once the minute has passed. The next
+        `pop_ready()` call re-emits them (they still satisfy the
+        ready-bucket predicate), so this is a genuine retry, not just a
+        way to avoid losing the data.
+
+        If a bucket for the same (key, minute) has since started
+        accumulating again — possible because awaiting the failed write
+        yields control and more events can arrive in that window — the
+        two are merged rather than one overwriting the other.
+        """
+        for key, minute, bucket in ready:
+            existing = self._buckets.get((key, minute))
+            if existing is None:
+                self._buckets[(key, minute)] = bucket
+            else:
+                existing.merge_older(bucket)
 
     def pending_count(self) -> int:
         """Number of buckets currently held in memory, not yet flushed —

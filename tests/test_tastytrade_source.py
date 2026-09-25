@@ -500,3 +500,70 @@ async def test_snapshot_greeks_batches_large_symbol_lists(source, fake_streamer)
     assert all(len(symbols) <= 200 for _, symbols in greeks_calls)
 
     await source.close()
+
+
+# --- Underlying feed-symbol resolution ---
+#
+# The live pipeline used to subscribe to underlying quotes with the raw
+# config ticker (e.g. "SPX"), which is a chain underlying code rather than
+# a feed symbol. The instruments API exposes the authoritative mapping, so
+# that is what's read here — with a fallback to the input on any failure,
+# since this must never be able to make things worse than before.
+
+
+def _patch_equity_get(monkeypatch, result=None, error=None):
+    """Fakes tastytrade.instruments.Equity.get without touching the
+    network. Verified against the real installed SDK's signature
+    (Equity.get(session, symbols) -> Equity)."""
+    import tastytrade.instruments as instruments
+
+    async def fake_get(session, symbols):
+        if error is not None:
+            raise error
+        return result
+
+    monkeypatch.setattr(instruments.Equity, "get", staticmethod(fake_get))
+
+
+@pytest.mark.asyncio
+async def test_get_underlying_streamer_symbol_returns_the_feed_symbol(source, monkeypatch):
+    class FakeEquity:
+        streamer_symbol = "/SPX"
+
+    _patch_equity_get(monkeypatch, result=FakeEquity())
+
+    assert await source.get_underlying_streamer_symbol("SPX") == "/SPX"
+
+
+@pytest.mark.asyncio
+async def test_get_underlying_streamer_symbol_passes_through_when_identical(source, monkeypatch):
+    class FakeEquity:
+        streamer_symbol = "SPY"
+
+    _patch_equity_get(monkeypatch, result=FakeEquity())
+
+    assert await source.get_underlying_streamer_symbol("SPY") == "SPY"
+
+
+@pytest.mark.asyncio
+async def test_get_underlying_streamer_symbol_falls_back_on_lookup_error(source, monkeypatch):
+    _patch_equity_get(monkeypatch, error=RuntimeError("instruments API down"))
+
+    assert await source.get_underlying_streamer_symbol("SPX") == "SPX"
+
+
+@pytest.mark.asyncio
+async def test_get_underlying_streamer_symbol_falls_back_when_field_is_empty(source, monkeypatch):
+    class FakeEquity:
+        streamer_symbol = ""
+
+    _patch_equity_get(monkeypatch, result=FakeEquity())
+
+    assert await source.get_underlying_streamer_symbol("SPX") == "SPX"
+
+
+@pytest.mark.asyncio
+async def test_get_underlying_streamer_symbol_requires_authentication():
+    src = TastyTradeSource(client_secret="secret", refresh_token="token")
+    with pytest.raises(RuntimeError, match="authenticate"):
+        await src.get_underlying_streamer_symbol("SPX")

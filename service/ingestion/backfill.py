@@ -132,8 +132,18 @@ class BackfillJob:
         try:
             path = Path(path_prefix)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.with_suffix(".json").write_text(json.dumps(report, indent=2, default=str))
-            path.with_suffix(".md").write_text(_report_to_markdown(report))
+            # Explicit UTF-8 on both: `write_text` otherwise uses the
+            # platform's default encoding, which on Windows is cp1252 and
+            # cannot represent the arrow characters in the markdown tables.
+            # The write then blows up mid-report — and because this is
+            # best-effort by design, the failure is swallowed and logged,
+            # so the JSON gets written and the human-readable file
+            # silently doesn't. Explicitly asking for UTF-8 makes the
+            # output identical everywhere rather than platform-dependent.
+            path.with_suffix(".json").write_text(
+                json.dumps(report, indent=2, default=str), encoding="utf-8"
+            )
+            path.with_suffix(".md").write_text(_report_to_markdown(report), encoding="utf-8")
             log.info("Report written to %s.md / .json", path)
         except Exception:
             log.exception("Failed to write diagnostic report to %s — continuing anyway.", path_prefix)

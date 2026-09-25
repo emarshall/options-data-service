@@ -262,15 +262,44 @@ async def collect_events(
     return events
 
 
+def is_nan(val: Any) -> bool:
+    """True if `val` is a NaN in either float or Decimal form.
+
+    dxfeed represents "field present but has no value" as NaN rather than
+    None — `Quote.bid_price` is a required `Decimal` field on the SDK's
+    event dataclasses, so `hasattr` is always True and it is never None
+    even when the feed has no bid to report. A plain `val is not None`
+    check therefore lets NaN straight through as if it were a real price,
+    which is how a NaN mark price can end up computed, bucketed, and
+    written into a `Numeric` column. Handles both `float('nan')` and
+    `Decimal('NaN')` since the SDK uses both depending on the field.
+    """
+    if isinstance(val, float):
+        return val != val  # NaN is the only value not equal to itself
+    is_nan_method = getattr(val, "is_nan", None)
+    if callable(is_nan_method):
+        try:
+            return bool(is_nan_method())
+        except Exception:
+            return False
+    return False
+
+
 def get_attr_any(obj: Any, *names: str, default=None):
     """Try several possible attribute names in order — useful for tolerating
     minor field-naming differences across SDK versions (learned the hard way
     in Task 0, where e.g. IV shows up as `imp_volatility` on some event
-    types)."""
+    types).
+
+    Treats NaN as "no value" (see `is_nan`), not just None — otherwise a
+    field the feed populates with NaN-to-mean-absent is indistinguishable
+    from a real one, which silently propagates garbage into the bar
+    tables instead of falling back to the next name or the default.
+    """
     for name in names:
         if hasattr(obj, name):
             val = getattr(obj, name)
-            if val is not None:
+            if val is not None and not is_nan(val):
                 return val
     return default
 

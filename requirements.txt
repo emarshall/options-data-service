@@ -1,6 +1,11 @@
 fastapi>=0.141.1
 uvicorn[standard]>=0.32.0
-sqlalchemy>=2.0.36
+# The [asyncio] extra is REQUIRED, not optional: it is what pulls in
+# greenlet, which SQLAlchemy's async support needs. In 2.0.x greenlet came
+# along as a base dependency so the extra looked redundant; in 2.1.x it is
+# only available via the extra, so a bare "sqlalchemy" install fails at
+# `import sqlalchemy.ext.asyncio`. See PLAN.md Section 7.
+sqlalchemy[asyncio]>=2.0.36
 alembic>=1.14.0
 asyncpg>=0.30.0
 psycopg[binary]>=3.2.0

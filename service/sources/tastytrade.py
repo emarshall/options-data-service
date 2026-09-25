@@ -140,6 +140,55 @@ class TastyTradeSource(MarketDataSource):
     # Streamer connection management
     # ------------------------------------------------------------------
 
+    async def get_underlying_streamer_symbol(self, ticker: str) -> str:
+        """Resolves the DXLink subscription symbol for an underlying's own
+        quotes via the instruments API.
+
+        The bug this fixes: the ingestion pipeline used to pass the raw
+        configured ticker (e.g. `SPX`) straight to `subscribe_quotes()`.
+        That string is TastyTrade's *option-chain underlying code*, and
+        the streaming feed does not necessarily resolve it — indices in
+        particular use a different convention on DXLink. The instruments
+        API exposes the authoritative mapping on the instrument's own
+        `streamer_symbol` field, which nothing in this codebase was
+        reading: `get_option_chain()` returns only `Option` objects and
+        discards the chain's `underlying` payload entirely.
+
+        Deliberately falls back to the input unchanged on any failure.
+        That keeps this strictly an improvement — if the lookup errors or
+        comes back empty, we behave exactly as before rather than
+        subscribing to something wrong — while still logging loudly
+        enough that a silent fallback doesn't hide a genuine mismatch.
+        """
+        from tastytrade.instruments import Equity
+
+        session = self._require_session()
+        try:
+            equity = Equity.get(session, ticker)
+            resolved = await equity if inspect.isawaitable(equity) else equity
+            streamer_symbol = getattr(resolved, "streamer_symbol", None)
+        except Exception as e:
+            log.warning(
+                "Couldn't resolve a DXLink symbol for underlying %r (%s) — falling back to "
+                "the configured ticker. If live underlying bars come up empty, this is why.",
+                ticker, e,
+            )
+            return ticker
+
+        if not streamer_symbol:
+            log.warning(
+                "Instruments API returned no streamer_symbol for underlying %r — falling back "
+                "to the configured ticker.", ticker,
+            )
+            return ticker
+
+        if streamer_symbol != ticker:
+            log.info(
+                "Underlying %r streams as %r on DXLink (configured ticker is not the "
+                "feed-native symbol).", ticker, streamer_symbol,
+            )
+        return streamer_symbol
+
     async def _ensure_streamer(self):
         """Returns the current streamer, connecting if necessary. Safe to
         call concurrently — e.g. from both listener loops on startup."""
