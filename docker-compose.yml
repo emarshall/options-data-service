@@ -105,6 +105,10 @@ services:
   # `docker compose up` (see `profiles` below) since it's a one-off/
   # periodic job, not a continuously-running service — run it explicitly:
   #   docker compose run --rm backfill
+  # Note: you normally do NOT need to run this by hand anymore — the
+  # `scheduler` service above runs exactly this command on a daily after-hours
+  # schedule, because NDX/VIX have no live quote feed and depend on it
+  # entirely. This manual path remains for ad-hoc catch-up.
   # On-demand: incremental by default (resumes from each contract/ticker's
   # latest existing bar — see PLAN.md Section 7) — use `--full` for an
   # occasional deep re-scan. `--report` writes a diagnostic summary (per-
@@ -138,9 +142,17 @@ services:
   # `docker compose up` (see `profiles`) — run it explicitly, typically
   # after a `backfill` run:
   #   docker compose run --rm greeks-backfill
+  #
+  # NOTE on passing flags: `docker compose run <svc> <args...>` REPLACES
+  # this command with <args...>, it does not append to it. So
+  # `--max-rows 5000` on its own fails with
+  # `exec: "--max-rows": executable file not found`. Repeat the full
+  # command instead:
+  #   docker compose run --rm greeks-backfill \
+  #     python -m service.greeks.backfill_job --max-rows 5000
   greeks-backfill:
     build: .
-    command: python -m service.greeks.backfill_job
+    command: ["python", "-m", "service.greeks.backfill_job"]
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
@@ -152,17 +164,228 @@ services:
     restart: "no"
     profiles: ["greeks-backfill"]
 
-  # On-demand, occasional-use companion to the plain `backfill` service
+  # Long-running scheduler: fires the daily `backfill` (plus the Greeks pass)
+  # on a fixed weekday after-hours schedule, so it doesn't have to be run by
+  # hand. This is a hard dependency, not a nicety — TastyTrade publishes live
+  # quotes for SPX but NOT for NDX or VIX (verified against the live feed
+  # 2026-09-30; see PLAN.md Section 7 "NDX and VIX have no live Quote feed"),
+  # so for those two tickers the candle-API backfill is their ONLY data
+  # source. Without this service, NDX/VIX silently go dark on any day the
+  # backfill isn't run — which is exactly what happened on 2026-09-30.
+  #
+  # Unlike `backfill`/`greeks-backfill`/`gap-reconcile` below, this one is NOT
+  # profile-gated: it's part of the normal running stack, because the whole
+  # point is that it keeps running unattended. To opt out, either drop this
+  # service or set SCHEDULER_ENABLED=false in .env.
+  #
+  # Schedule (all overridable in .env — see service/config/settings.py):
+  #   SCHEDULER_RUN_TIME=16:30        HH:MM America/New_York, weekdays only
+  #   SCHEDULER_RUN_ON_STARTUP=true   also run once at boot, to catch up a
+  #                                   slot missed while the container was down
+  #   SCHEDULER_RUN_GREEKS=true       run the Greeks pass after the candles
+  #                                   (Task 5's backfill never writes Greeks,
+  #                                   so without this, daily-backfilled option
+  #                                   bars land with NULL Greeks)
+  #   SCHEDULER_RUN_GAP_RECONCILE=false  also do the slow full gap rescan
+  # Reports land in ./backfill_reports/ on the host, same as a manual run.
+  # Watch it with: docker compose logs -f scheduler
+  scheduler:
+    build: .
+    command: python -m service.ingestion.scheduler
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./backfill_reports:/app/backfill_reports
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Unlike the one-shot job services, this one must come back on its own if
+    # it dies — a dead scheduler is invisible until you notice missing bars.
+    restart: unless-stopped
+    # No healthcheck: this process exposes nothing to probe, and a
+    # "did the last run succeed" check isn't meaningfully expressible as a
+    # container health state (a run can legitimately take hours). Run history
+    # and failures are in `docker compose logs scheduler`.
+    # mem_limit: 512m
+    # cpus: 1.0
+
+  # Near-real-time underlying poller (see service/ingestion/live_underlying.py).
+  # TastyTrade's DXFeed has NO live Quote feed for VIX/NDX (only SPX), so those
+  # two used to get their 1m bars only from the once-a-day after-hours backfill.
+  # This service instead builds their newest bars every minute during the
+  # session and writes them to underlying_bars_1m, so VIX/NDX are available
+  # intraday for the strategy monitors below (and any other consumer).
+  #
+  # Rows are a narrow slice of the backfill, NOT `backfill` run on a 1m timer:
+  # only the two underlyings, same idempotent write path, so rows are identical
+  # in shape to backfilled ones. The daily backfill still owns full history +
+  # option contracts.
+  #
+  # Startup catch-up: the default `trade` source is live-only, so a mid-session
+  # restart would otherwise leave a permanent morning hole (this happened on
+  # 2026-10-13 - a 17:01 UTC restart left NDX with no bars before 16:46 UTC).
+  # On boot the poller replays the gap from the Candle feed once per ticker
+  # before the live loop; skip with --no-catch-up.
+  #
+  # Tune via env: LIVE_UNDERLYING_TICKERS (default "VIX,NDX"),
+  # LIVE_UNDERLYING_CATCH_UP_HOURS (default 8, the max lookback the catch-up
+  # will replay), and flags --interval/--lookback-min/--window-start/
+  # --window-end (defaults: 60s / 4min / 13:25 / 20:20 UTC, weekdays only).
+  underlying-live:
+    build: .
+    command: python -m service.ingestion.live_underlying
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # mem_limit: 256m
+    # cpus: 0.5
+
+  # Near-real-time option-candle poller (see service/ingestion/live_options.py).
+  # SPX option quotes/bars stream live into `ingestion`, but NDX option 1m
+  # candles only existed after the once-a-day backfill (16:30 ET). This service
+  # pulls just the last few minutes of candles for the day's 0DTE contracts
+  # every minute during the session and writes them to option_bars_1m, so NDX
+  # 0DTE option bars — with IV, needed for the 0DTE strategy monitor below —
+  # exist intraday, exactly as the history they're compared against does.
+  #
+  # Same narrow-slice philosophy as underlying-live: reuses the backfill's own
+  # candidate resolution + idempotent per-contract write path, restricted to
+  # today's expiration and to the polled ticker(s), so rows are byte-identical
+  # in shape to backfilled ones. The daily backfill still owns full history +
+  # Greeks reconciliation.
+  #
+  # Tune via env: LIVE_OPTIONS_TICKERS (default "NDX"), and flags
+  # --interval/--lookback-min/--window-start/--window-end/--concurrency
+  # (defaults: 60s / 6min / 13:20 / 20:20 UTC / 8, weekdays only).
+  options-live:
+    build: .
+    command: python -m service.ingestion.live_options
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-options_user}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-options_data}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # mem_limit: 256m
+    # cpus: 0.5
+
+  # Always-on entry-signal monitor for the strategy backtested in
+  # zerodte-backtester (reference config; signal + entry logic reused from
+  # scripts/vix_spx_long_call.py). Polls the API every minute, recomputes the
+  # trigger on today's live session, and alerts once per day: SIGNAL line in
+  # docker logs + JSON in ./runtime/strategy-alerts/ (host chime script polls
+  # that dir) + optional phone push (ntfy.sh / Telegram / Pushover).
+  #
+  # VIX data note: VIX has no live Quote feed, but the `underlying-live`
+  # service above now writes its 1m bars intraday (a few seconds behind), so if
+  # that service is running the monitor detects the trigger during the session.
+  # As a safety net (underlying-live down, or a day it missed), the monitor
+  # also runs a post-close catch-up window: MONITOR_WINDOW_START=13:00 /
+  # MONITOR_WINDOW_END=21:30 UTC by default, so it still fires once the daily
+  # after-hours backfill (~16:30 ET = 20:30 UTC) lands VIX bars.
+  #
+  # Notifiers read from .env: NTFY_TOPIC (shared) / NTFY_TOPIC_<TICKER>
+  # (per-ticker override, e.g. NTFY_TOPIC_NDX), TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID,
+  # PUSHOVER_USER_KEY/PUSHOVER_API_TOKEN. With none set the monitor runs in
+  # log-only mode.
+  #
+  # Signal params are tunable from .env too (read because this service uses
+  # env_file: .env): MONITOR_VIX_DROP (0.015), MONITOR_SPX_RISE (0.003),
+  # MONITOR_DELTA (0.50), MONITOR_DELTA_SLIPPAGE (0.03), MONITOR_DTE (3),
+  # MONITOR_DTE_TOLERANCE (1), MONITOR_PROFIT_PCT (400), MONITOR_STOP_LOSS_PCT
+  # (50), MONITOR_EXPIRE_OFFSET_MIN (60). CLI flags override them if you'd
+  # rather set them in the `command:` below. Retune and re-snapshot
+  # results/reference/reference_config.json together, or monitor and backtest
+  # will describe different rules.
+  strategy-monitor:
+    build:
+      context: ../zerodte-backtester
+      dockerfile: monitor/Dockerfile
+    env_file: .env
+    environment:
+      DATA_SERVICE_BASE_URL: http://api:8000
+      STATE_FILE: /app/state/state.json
+      ALERT_DIR: /app/alerts
+      MONITOR_INTERVAL_SECONDS: "60"
+    volumes:
+      - ./runtime/strategy-state:/app/state
+      - ./runtime/strategy-alerts:/app/alerts
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    # mem_limit: 128m
+
+  # Always-on 0DTE entry-signal monitor for the four best 0DTE strategies in
+  # zerodte-backtester (the "relaxed grid, mid fills" winners — see
+  # FINDINGS_RELAXED_MID.md / monitor/0dte_configs.json). Mirrors strategy-
+  # monitor above, but reuses the backtest engine's own entry-decision and
+  # strike-selection functions (scripts/live_monitor_0dte.py) and alerts
+  # once per day per config, on the fill minute, strictly from COMPLETED
+  # minute-bars only (no-lookahead by construction).
+  #
+  # NDX data note: NDX option 1m candles come intraday from the `options-live`
+  # service above (NDX has no live option-quote ingestion), and NDX/VIX
+  # underlyings from `underlying-live`. Until those run, the NDX configs log
+  # "waiting_for_data" and keep polling; the 13:00-21:30 UTC window doubles as
+  # a post-close catch-up via the daily backfill, same safety net as
+  # strategy-monitor.
+  #
+  # Configs are fixed (not env-tunable by design): they must match the
+  # recorded backtests' StrategyConfig fields exactly, and drift is a real
+  # correctness hazard for "what would the backtest do today". Edit
+  # monitor/0dte_configs.json in zerodte-backtester to change them.
+  #
+  # Same notifiers as strategy-monitor (read from .env): NTFY_TOPIC (shared) /
+  # NTFY_TOPIC_<TICKER> (per-ticker override, e.g. NTFY_TOPIC_NDX routes NDX
+  # alerts to their own topic), TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID,
+  # PUSHOVER_USER_KEY/PUSHOVER_API_TOKEN. None set => log-only mode.
+  strategy-monitor-0dte:
+    build:
+      context: ../zerodte-backtester
+      dockerfile: monitor/Dockerfile.0dte
+    env_file: .env
+    environment:
+      DATA_SERVICE_BASE_URL: http://api:8000
+      STATE_FILE: /app/state/state_0dte.json
+      ALERT_DIR: /app/alerts_0dte
+      MONITOR_INTERVAL_SECONDS: "60"
+    volumes:
+      - ./runtime/strategy-0dte-state:/app/state
+      - ./runtime/strategy-0dte-alerts:/app/alerts_0dte
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    # mem_limit: 128m
   # above (which is now incremental-by-default — see PLAN.md Section 9/the
   # underlying-backfill bug entry in Section 7 — so it no longer re-scans
   # everything on every run). This one does re-scan everything in the
   # lookback window specifically to find and fill real gaps (missing
   # minutes for a continuously-quoted underlying), not just catch up since
-  # the last known bar — slower, so it's not meant to run on every
-  # schedule tick the way `backfill` is. Recommended cadence: daily, via
-  # host cron/systemd timer (there's no in-process scheduler for this —
-  # see Task 11 in PLAN.md, deliberately deferred), e.g.:
-  #   0 6 * * * cd /path/to/options-service && docker compose run --rm gap-reconcile
+  # the last known bar — slower, so it's off in the daily `scheduler`
+  # schedule by default. Two ways to run it on a cadence:
+  #   1. Set SCHEDULER_RUN_GAP_RECONCILE=true in .env (uses the in-container
+  #      scheduler — preferred, no host cron needed).
+  #   2. Host cron/systemd timer, e.g.:
+  #        0 6 * * * cd /path/to/options-service && docker compose run --rm gap-reconcile
   # Check what it found/fixed via `GET /gaps` (service/api/routes.py) or
   # ./backfill_reports/*.md on the host (see the `backfill` service's own
   # comment above — same --report mechanism, same mount).

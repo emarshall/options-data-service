@@ -59,6 +59,27 @@ import logging
 _NOISY_THIRD_PARTY_LOGGERS = ("tastytrade", "httpx", "httpcore", "websockets", "hpack")
 
 
+def clamp_noisy_third_party_loggers() -> None:
+    """Re-apply the `_NOISY_THIRD_PARTY_LOGGERS` clamps.
+
+    Needed whenever a noisy dependency is imported *lazily*, i.e. after
+    `configure_logging` has already run. The `tastytrade` package sets
+    `logging.getLogger("tastytrade").setLevel(logging.DEBUG)` at its own
+    import time, so any entry point that defers
+    `from service.sources.tastytrade import TastyTradeSource` to inside a
+    function (to keep the CLI's import graph light) silently re-enables the
+    raw-websocket-message flood the clamp exists to prevent. Calling this
+    right after the deferred import restores the intended behavior.
+
+    Deliberately separate from `configure_logging` so that it is
+    idempotent and safe to call any number of times, and so the call sites
+    document *why* it is needed (the deferred import) rather than looking
+    like defensive noise.
+    """
+    for name in _NOISY_THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def configure_logging(app_logger_name: str, level: str = "INFO") -> None:
     """Call once, at process startup, before doing anything else that
     might import/use a third-party library. Sets up a single root
@@ -68,6 +89,9 @@ def configure_logging(app_logger_name: str, level: str = "INFO") -> None:
     at `level`, and silences the known-noisy dependencies above
     regardless of `level` — so requesting DEBUG for our own code doesn't
     accidentally re-enable the flood this function exists to prevent.
+
+    If a noisy dependency is imported later, lazily, also call
+    `clamp_noisy_third_party_loggers()` after that import.
     """
     resolved_level = getattr(logging, level.upper(), logging.INFO)
 
@@ -83,5 +107,4 @@ def configure_logging(app_logger_name: str, level: str = "INFO") -> None:
     logging.getLogger(app_logger_name).setLevel(resolved_level)
     logging.getLogger("service").setLevel(resolved_level)
 
-    for name in _NOISY_THIRD_PARTY_LOGGERS:
-        logging.getLogger(name).setLevel(logging.WARNING)
+    clamp_noisy_third_party_loggers()

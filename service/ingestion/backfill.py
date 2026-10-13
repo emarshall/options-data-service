@@ -59,10 +59,19 @@ from service.config.settings import AppConfig
 from service.db.models import Contract, OptionBar1m, UnderlyingBar1m
 from service.ingestion.contract_manager import ContractManager, ResolvedContract
 from service.ingestion.gap_detection import RETENTION_DAYS, find_gaps
-from service.sources._async_utils import get_attr_any
+from service.sources._async_utils import close_ok, get_attr_any
 from service.sources.base import MarketDataSource
 
-log = logging.getLogger(__name__)
+# NOT `logging.getLogger(__name__)`. This module is run as
+# `python -m service.ingestion.backfill` (the `backfill` and
+# `gap-reconcile` compose services both do), which executes it under the
+# name `__main__` — a different logger from the
+# `"service.ingestion.backfill"` one that `configure_logging` raises to
+# the configured level. The `__main__` logger stays at the root WARNING
+# level, so the per-25-contract progress logging below was silently
+# dropped in real runs. Naming the logger explicitly keeps it under
+# `service.*` regardless of invocation.
+log = logging.getLogger("service.ingestion.backfill")
 
 # Comfortably beyond Task 0's confirmed ~6-week (~43 day) retention window
 # for OPTION CONTRACTS specifically. Over-requesting is harmless for a
@@ -575,6 +584,7 @@ class BackfillJob:
         warnings: list[str] = []
         skipped_existing = 0
         skipped_no_time = 0
+        skipped_invalid = 0
         distinct_days: set = set()
         candles_per_day: dict = {}
         if not candles:
@@ -597,6 +607,15 @@ class BackfillJob:
                         skipped_existing += 1
                         continue
 
+                    close = get_attr_any(candle, "close")
+                    if not close_ok(close):
+                        # Zeroed/absent candles from a degraded feed must not
+                        # be written — a 0.0 row can never be repaired by a
+                        # later run (skip-if-exists). Skip so a healthy
+                        # future pass can still fill the minute.
+                        skipped_invalid += 1
+                        continue
+
                     session.add(
                         UnderlyingBar1m(
                             time=bar_time,
@@ -604,12 +623,17 @@ class BackfillJob:
                             open=get_attr_any(candle, "open"),
                             high=get_attr_any(candle, "high"),
                             low=get_attr_any(candle, "low"),
-                            close=get_attr_any(candle, "close"),
+                            close=close,
                             volume=get_attr_any(candle, "volume"),
                         )
                     )
                     written += 1
                 await session.commit()
+            if skipped_invalid:
+                log.warning(
+                    "%s: skipped %d candle(s) with no usable close (feed zeroed?) — not writing them.",
+                    ticker, skipped_invalid,
+                )
 
         if diagnostics is not None:
             diagnostics.update(request_diag or {})
@@ -876,7 +900,16 @@ async def _main() -> None:
 
     from service.config.settings import get_settings
     from service.db.session import get_session_factory
+    from service.logging_config import clamp_noisy_third_party_loggers
     from service.sources.tastytrade import TastyTradeSource
+
+    # The import above is deliberate (keeps the CLI's import graph light
+    # enough to reach `argparse` --help without pulling in the whole SDK),
+    # but it means the `tastytrade` package's own import-time
+    # `setLevel(DEBUG)` on its top-level logger runs *after* the
+    # `configure_logging()` call above already clamped it to WARNING —
+    # silently re-enabling the raw-websocket-message flood. Re-clamp.
+    clamp_noisy_third_party_loggers()
 
     settings = get_settings()
     if not (settings.tastytrade_client_secret and settings.tastytrade_refresh_token):

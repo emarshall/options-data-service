@@ -122,9 +122,10 @@ These were discussed and decided — do not revisit without good reason.
   repeatedly). **Recommendation: wire it in, but rate-limited and logged**, rather than leaving the
   daily manual `backfill` as the safety net. **Not yet decided or implemented** — flagging it so a later
   task picks it up rather than rediscovering the question.
-- ~~Is live underlying coverage now actually good?~~ **RESOLVED (2026-09-25, by production DB diagnostic):
-  yes, it is healthy — the gap that made daily manual `backfill` necessary was historical, not
-  ongoing.** Measured during regular trading hours (09:30–16:00 America/New_York) against production:
+- ~~Is live underlying coverage now actually good?~~ **PARTIALLY RESOLVED, then OVERTURNED (2026-09-30).
+  The coverage numbers below are real, but the conclusion I first drew from them was wrong, and the
+  correction matters more than the numbers.** Measured during regular trading hours (09:30–16:00
+  America/New_York) against production:
   - Last 9 trading days: **NDX 3510/3510 = 100.00%**, **SPX 3510/3510 = 100.00%**,
     **VIX 3501/3510 = 99.74%**.
   - **Decomposition of the residual gap, 2026-08-03 → 2026-09-25 (40 weekdays). The headline is that
@@ -163,6 +164,19 @@ These were discussed and decided — do not revisit without good reason.
     back, both well outside the ~7,600–7,950-candle count-based retention already documented in the
     Section 7 retention entry. **That history is very likely permanently unfillable** — worth one
     confirmation run before writing it off entirely, but do not expect `backfill` to recover it.
+  - **!!! THE COVERAGE NUMBERS ABOVE DO NOT MEAN LIVE INGESTION IS WORKING. OVERTURNED 2026-09-30.**
+    The table above is real, and the "no unexplained loss" conclusion is real *as a statement about
+    the database*. What is wrong is the inference I drew from it — that live ingestion was healthy and
+    the daily `backfill` was merely a historical safety net. It was not. See the Section 7 entry
+    "NDX and VIX have no live Quote feed." In short: **live ingestion has never once produced a
+    single NDX or VIX bar, on any day, ever.** All NDX and VIX rows in that table were written by
+    `backfill` from the candle API. Only SPX is live-ingested. So the daily `backfill` is not a
+    convenience or a safety net for 2 of the 3 configured tickers — **it is their only data source**,
+    and the excellent coverage numbers are a measure of how well `backfill` is being run, not of
+    ingestion health. **Lesson: DB coverage cannot distinguish a healthy live path from a working
+    backfill, and I had already proven provenance was unreadable from the data (see the `volume`
+    correction immediately below) — then went ahead and inferred provenance anyway instead of
+    checking the ingestion log, which would have answered it in one command.**
   - **Correction to an earlier assumption of mine:** the natural way to split live rows from
     backfilled rows (live = `volume IS NULL`, backfilled = volume populated) **does not work for this
     table.** Every row in `underlying_bars_1m` has `volume IS NULL`, including rows written by
@@ -1298,11 +1312,15 @@ that fix.
 - **Known, unavoidable limit:** none of this can recover data older than TastyTrade's ~6-week candle
   retention window (Task 0's confirmed finding) — a gap that old will keep showing up in `/gaps` and
   reconciliation will not clear it, because the underlying data simply no longer exists on the feed.
-- **Automation:** deliberately *not* built as an in-process scheduler — Task 11 (monitoring/alerting,
-  including any kind of internal scheduling) is explicitly deferred as lowest-priority/optional in this
-  plan, and adding a scheduler here would be scope creep beyond what was asked. Documented host
-  cron/systemd timer as the recommended way to run `gap-reconcile` on a regular cadence instead (see
-  README.md).
+- **Automation:** deliberately *not* built as an in-process scheduler *at the time of this entry* —
+  Task 11 (monitoring/alerting, including any kind of internal scheduling) was explicitly deferred as
+  lowest-priority/optional in this plan, and adding a scheduler for this was scope creep beyond what
+  was asked. Host cron/systemd timer was documented as the recommended way to run `gap-reconcile` on
+  a regular cadence. **Superseded 2026-09-30:** a scheduler now exists
+  (`service/ingestion/scheduler.py`) because NDX/VIX turned out to depend on the daily backfill for
+  their *only* data — see the "NDX and VIX have no live Quote feed" entry in Section 7. `gap-reconcile`
+  is still off in that schedule by default; `SCHEDULER_RUN_GAP_RECONCILE=true` opts it in, and host
+  cron remains a perfectly valid alternative.
 - **Verification:** 10 new tests for `gap_detection.py` (including the two exact scenarios from the
   bug report — a multi-hour intraday gap, and a multi-week gap), 4 new tests for
   `reconcile_underlying_gaps`/incremental-start behavior in `test_backfill.py`, and 6 new integration
@@ -1910,6 +1928,66 @@ closes out the entire "why won't the gaps close" investigation with a definitive
 - **Files:** `service/ingestion/gap_detection.py` (`RETENTION_DAYS`), `service/ingestion/backfill.py`
   (`DEFAULT_LOOKBACK_DAYS` comment only), `service/api/routes.py` (`GET /gaps` docstring), `README.md`.
 
+**[2026-09-30 — NOT FIXED, upstream feed limitation, but a real product-level defect]** **NDX and VIX
+have no live Quote feed: live ingestion has never produced a single bar for either, on any day.**
+Symptom as reported: "ingestion has been up all morning and there is no new underlying data today."
+What was actually happening:
+- Ingestion is running, healthy, and flushing. It is subscribed to `SPX`, `NDX`, and `VIX` (verified
+  in the logs: bare `{'symbol': 'NDX', 'type': 'Quote'}` and `{'symbol': 'VIX', 'type': 'Quote'}`
+  subscription entries are sent, repeatedly, on every contract refresh).
+- Per-day count of bare Quote events received by the ingestion container, from its own logs:
+
+  | Date | SPX | NDX | VIX |
+  |---|---|---|---|
+  | 2026-09-25 | 22,349 | **0** | **0** |
+  | 2026-09-26 | 1 | **0** | **0** |
+  | 2026-09-27 | 1 | **0** | **0** |
+  | 2026-09-28 | 2 | **0** | **0** |
+  | 2026-09-29 | 48,505 | **0** | **0** |
+  | 2026-09-30 | 29,009 | **0** | **0** |
+
+- Subscribing to an unavailable symbol **fails silently** — no `ERROR` message, no ack, nothing. The
+  only warnings in the log are unrelated `UNAUTHORIZED` token-expiry events, and the only
+  "not tracked contract" warnings are for *VIX option* contracts (`.VIXW261007P100` etc.), not the
+  index. So the failure is completely invisible from the logs as written.
+- Ruled out along the way: a stale/broken subscription from the last restart. The container
+  crash-looped at 2026-09-29T21:12:53Z on an expired auth token and auto-restarted at that exact
+  second; NDX/VIX were fine on 9/28 and 9/29 and dead from that restart onward, which initially looked
+  conclusive. A clean `docker compose restart ingestion` mid-session on 9/30 did **not** fix it — SPX
+  resumed within seconds, NDX/VIX stayed at exactly 0.
+- Ruled out symbol spelling. A direct 30-second subscription test against the live feed, counting
+  received events by `Quote.event_symbol`:
+
+  | Subscribed symbol | Events in 30s |
+  |---|---|
+  | `SPX` | 28 |
+  | `SPX:IND` | 0 |
+  | `NDX` | 0 |
+  | `NDX:IND` | 0 |
+  | `NDX:INDEX` | 0 |
+  | `VIX` | 0 |
+  | `VIX:IND` | 0 |
+  | `VIX:INDEX` | 0 |
+
+  **Conclusion: TastyTrade's DXFeed does not publish live quotes for `NDX` or `VIX` at all.** `SPX` is
+  the exception, not the rule. This is upstream and not fixable client-side.
+- **Impact:** for 2 of the 3 configured tickers, `backfill` (candle API) is the *sole* data source, not
+  a supplement. Every NDX and VIX bar in the database came from `backfill`. Consequences to weigh:
+  1. The daily `backfill` is a **hard dependency** for NDX/VIX. If it isn't run, those series go dark —
+     which is exactly the 2026-09-30 situation (backfill container not running, NDX/VIX empty for the
+     day while SPX streamed normally).
+  2. Ingestion should not advertise these as live-captured. Either drop `capture_underlying_bars` for
+     NDX/VIX and document them as backfill-only, or keep it and add an explicit warning.
+  3. Coverage looked excellent (100% RTH) precisely *because* backfill had been run diligently, which
+     is what made this so easy to misread as a healthy live path.
+- **Not yet done (deliberately, needs a decision):** no code change made. The obvious follow-ups are a
+  startup log line that names which configured underlyings actually delivered events, and/or a
+  counter-based health signal — the `Quote`/`Greeks` counters added in the 2026-09-25 hardening cover
+  options vs. underlyings in aggregate but are **not** broken down per symbol, which is exactly why
+  this stayed invisible for five days. Per-underlying event counters would have surfaced it in the
+  first five minutes.
+- **Files:** none changed for this entry (diagnosis only).
+
 **[Task 4 — post-deployment hardening, 2026-09-25]** Live underlying bars were almost entirely absent
 from `underlying_bars_1m`, which is what had been making a daily manual `backfill` look necessary.
 Five independent defects, each logged separately below, were all capable of causing it. This entry is
@@ -1946,14 +2024,19 @@ config ticker rather than the feed's own symbol for that instrument.
   `tests/test_tastytrade_source.py`.
 - **General lesson:** in any data provider API, distinguish "the identifier your users/config use" from
   "the identifier the vendor's feed expects," and never assume they're the same string. **Caveat, now
-  settled by evidence (2026-09-25 diagnostic):** this was **not** the cause of the missing underlying
-  data. Live logs show the feed delivering bare `SPX` and `NDX` Quote events under exactly those
-  symbols, so the identity mapping is correct for these instruments and `get_underlying_streamer_symbol()`
-  resolves them to themselves. RTH coverage is ~100%. The fix is kept because it is cheap, strictly
-  safe (the fallback can only return the input ticker), and genuinely protects against a future
-  instrument whose feed symbol *does* differ — but it should not be credited with solving the original
-  problem. Worth remembering how this was settled: the theory looked plausible for a long time and only
-  fell to a direct measurement of the actual event stream.
+  corrected twice over (2026-09-30):** I first wrote this off as "not the cause" because live logs show
+  the feed delivering bare `SPX` and `NDX` Quote events — **that observation was wrong; only `SPX` ever
+  appears.** I overgeneralized from the one symbol that happened to work. The underlying concern was
+  legitimate after all, though the specific fix is not what's needed: `NDX` and `VIX` are not available
+  as live Quote symbols under *any* spelling (see the "no live Quote feed" entry — `NDX`, `NDX:IND`,
+  `NDX:INDEX`, `VIX`, `VIX:IND`, `VIX:INDEX` were all tested and all silent). This is an upstream
+  feed limitation, not a symbol-mapping mistake, so `get_underlying_streamer_symbol()` cannot rescue
+  it. The function stays (cheap, safe, and correct in principle), but it is **not** the fix for
+  anything currently observed.
+- **Second lesson, and the one that actually cost time:** a single working symbol is not evidence about
+  its peers. "SPX works, therefore identity mapping is correct for the underlyings" was a
+  generalization I never tested. When a finding covers a set of N things, the evidence has to cover all
+  N, or the claim has to be scoped explicitly to the one that was measured.
 
 **[Task 4 — post-deployment hardening, 2026-09-25]** A failed flush permanently discarded the bars it
 had already popped out of memory.
@@ -2092,6 +2175,48 @@ failing opt-in Postgres test left its schema behind and broke every *other* test
   itself documents as needed only for async use. Declare the extra you actually rely on rather than
   relying on it arriving transitively; when a rebuild-first-good-service-second failure appears, check
   the image's package versions against the last-known-good image *before* reading application code.
+
+**[2026-09-30] NDX and VIX have no live Quote feed — the daily backfill is their *only* data source,
+so it must be scheduled, not remembered.**
+- **Symptom:** `/underlying/bars?underlying=NDX` and `...=VIX` had no bars for the current session,
+  while `SPX` streamed normally. The obvious reads — "ingestion is broken", "a container is crash-
+  looping", "the subscription list is stale/wrong" — were all wrong: a graceful restart produced a
+  healthy container that logged SPX quote events every few seconds and **zero** NDX/VIX events, on
+  every day it has ever run. The user was also *manually* running the backfill each day, which is
+  what made the database look well-covered and hid the fact that nothing was live.
+- **Root cause:** TastyTrade's DXFeed does not publish live `Quote` events for NDX or VIX under any
+  symbol spelling. Verified directly against the live feed with a 30s probe: `SPX` → 28 events, while
+  `NDX`, `NDX:IND`, `NDX:INDEX`, `VIX`, `VIX:IND` and `VIX:INDEX` all → **0** events. Separately, every
+  NDX/VIX bar in the database had come from the candle-API backfill, not the live pipeline. So for
+  these two tickers `backfill` is not a convenience for filling history — it is the only path by which
+  intraday data can exist at all, and nothing in the system enforced running it.
+- **Fix:** added `service/ingestion/scheduler.py` plus a non-profile-gated `scheduler` compose service
+  that runs `python -m service.ingestion.backfill --report` followed by
+  `python -m service.greeks.backfill_job` on a fixed weekday after-hours schedule (default
+  16:30 America/New_York, configurable via `SCHEDULER_RUN_TIME`). Jobs
+  run as subprocesses so a failing/OOMing multi-hour backfill can't kill the scheduler loop. The
+  schedule is computed in `America/New_York` via `zoneinfo` rather than UTC, so it doesn't drift an
+  hour across DST, and `SCHEDULER_RUN_ON_STARTUP` (default on) does a catch-up run so a container that
+  was down across a slot doesn't silently skip a trading day.
+- **Design note — do not "simplify" this back to host cron:** the failure mode being prevented is a
+  *silent* one. A missed run looks exactly like a quiet market day; there is no error, no crash, and
+  `/metadata` still returns 200 with plausible-looking counts. Keeping the schedule in the same
+  compose file as the services it depends on means it can't be forgotten during a redeploy on a
+  different host.
+- **Design note — Greeks must be in the same sequence:** the candle backfill writes
+  `option_bars_1m` rows but never writes Greeks. Without the follow-up `greeks-backfill`, every
+  daily-backfilled option bar would land with NULL Greeks — silently wrong for any Greeks-dependent
+  backtest, with no error to signal it. Hence `SCHEDULER_RUN_GREEKS` defaults to on.
+- **Files:** `service/ingestion/scheduler.py` (new), `service/config/settings.py` (5 new fields),
+  `docker-compose.yml` (`scheduler` service), `.env.example`, `tests/test_scheduler.py` (new, 31
+  tests), `README.md`.
+- **General lesson:** *"we subscribe to a symbol" is not evidence that data will flow for it.* A
+  database full of rows is equally not evidence of liveness, if something else could be writing them.
+  When a feed is silent, check *per-symbol* event counts and confirm the row provenance before
+  concluding anything about the pipeline — the honest question is "which code path produced this row,"
+  not "is this row present." Related: `volume IS NULL` cannot answer that, since both the live path
+  and the backfill path store NULL volume; distinguishing them would need an explicit
+  provenance column.
 
 **Template for new entries** (copy this when adding one):
 

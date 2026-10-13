@@ -147,8 +147,44 @@ class AppConfig(BaseSettings):
         default="10:00", alias="CONTRACT_REFRESH_FAST_WINDOW_END"
     )
 
+    # --- After-hours maintenance scheduler (see service/ingestion/scheduler.py) ---
+    # Why this exists at all: TastyTrade's DXFeed publishes live quotes for
+    # SPX but not for NDX or VIX under any symbol spelling (verified against
+    # the live feed 2026-09-30 — see PLAN.md Section 7, "NDX and VIX have no
+    # live Quote feed"). For those two tickers the candle-API `backfill` is
+    # the ONLY data source, so it stops being an optional convenience and
+    # becomes a hard daily dependency. Previously that meant remembering to
+    # run it by hand; this schedule makes it automatic.
+    scheduler_enabled: bool = Field(default=True, alias="SCHEDULER_ENABLED")
+    # HH:MM, America/New_York. Must be after the 16:00 close; the default adds
+    # a 30-minute buffer so the last regular-hours bars (and the 15:55-16:00
+    # window where the feed is still settling) have been written and flushed
+    # by the live pipeline before backfill starts reading. Parsed via zoneinfo
+    # so DST is handled automatically.
+    scheduler_run_time: str = Field(default="16:30", alias="SCHEDULER_RUN_TIME")
+    # Run one job immediately on startup in addition to the daily schedule.
+    # Deliberate: if the container was down (or the host rebooted) across a
+    # scheduled slot, the default is to catch up rather than silently skip a
+    # trading day. Cheap in practice because `backfill` is incremental by
+    # default — a redundant run mostly requests nothing. Set false if you'd
+    # rather it strictly waited for the next slot.
+    scheduler_run_on_startup: bool = Field(default=True, alias="SCHEDULER_RUN_ON_STARTUP")
+    # Run the Greeks pass after the candle backfill. IMPORTANT to leave on:
+    # Task 5's backfill writes option_bars_1m rows but never writes Greeks, so
+    # without this every daily-backfilled option bar lands with NULL Greeks —
+    # silently wrong for any Greeks-dependent backtest.
+    scheduler_run_greeks: bool = Field(default=True, alias="SCHEDULER_RUN_GREEKS")
+    # Also run the (much slower) full underlying-gap rescan. Off by default:
+    # it re-scans the whole lookback window every time, and since NDX/VIX bars
+    # arrive from the candle backfill rather than live, the plain `backfill`
+    # already covers them. Turn on if you want minute-level auditing too.
+    scheduler_run_gap_reconcile: bool = Field(
+        default=False, alias="SCHEDULER_RUN_GAP_RECONCILE"
+    )
+
     @field_validator(
-        "contract_refresh_fast_window_start", "contract_refresh_fast_window_end"
+        "contract_refresh_fast_window_start", "contract_refresh_fast_window_end",
+        "scheduler_run_time",
     )
     @classmethod
     def _validate_hhmm(cls, v: str) -> str:

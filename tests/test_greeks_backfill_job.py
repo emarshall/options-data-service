@@ -6,6 +6,7 @@ tests focus on the row-selection, skip-reason, and update logic rather than
 re-verifying the math.
 """
 
+import asyncio
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,7 @@ from sqlalchemy.pool import StaticPool
 
 from service.db.models import Base, GreeksSource, OptionBar1m, OptionRight, UnderlyingBar1m
 from service.greeks.backfill_job import GreeksBackfillJob
+from service.ingestion.gap_detection import RETENTION_DAYS
 
 _MARKET_TZ = ZoneInfo("America/New_York")
 _RISK_FREE_RATE = 0.045
@@ -227,3 +229,107 @@ async def test_batching_processes_more_rows_than_one_batch_size(db_session_facto
 
     assert summary["rows_processed"] == 5
     assert summary["computed"] == 5
+
+
+@pytest.mark.asyncio
+async def test_uncomputable_rows_do_not_cause_an_infinite_loop(db_session_factory):
+    """The regression test for the livelock.
+
+    Every row here is uncomputable (no underlying bar at all) but recent
+    enough to pass the prefilter, so each one is examined and skipped
+    without ever leaving the `greeks_source IS NULL` result set. Before
+    the keyset-pagination fix, `LIMIT`-only paging re-fetched these same
+    rows forever and the run never terminated.
+
+    The skip counts are asserted too, so this also pins the "skipped
+    rows are still visited exactly once" behavior rather than just
+    "eventually stopped."
+    """
+    async with db_session_factory() as session:
+        for i in range(5):
+            await _add_option_bar(session, contract_id=f"SPY_{i}", strike=400.0 + i)
+        # deliberately no underlying bars
+
+    job = GreeksBackfillJob(db_session_factory, _RISK_FREE_RATE, batch_size=2)
+    summary = await asyncio.wait_for(job.run(), timeout=30)
+
+    assert summary["computed"] == 0
+    # Each row examined exactly once — not re-fetched on later batches.
+    assert summary["rows_processed"] == 5
+    assert summary["skipped_no_underlying_bar"] == 5
+
+
+@pytest.mark.asyncio
+async def test_skipped_rows_do_not_starve_later_computable_rows(db_session_factory):
+    """A batch mixing uncomputable and computable rows must compute the
+    computable ones. Guards the interaction between the skip path and the
+    cursor advancing past skipped rows."""
+
+    async with db_session_factory() as session:
+        early = _bar_time_before_close(_expiring_in(10), hours_before_close=6.0)
+        late = _bar_time_before_close(_expiring_in(10), hours_before_close=2.0)
+        # earliest rows have no underlying bar; later ones do
+        await _add_option_bar(session, bar_time=early, contract_id="SPY_EARLY")
+        await _add_option_bar(session, bar_time=late, contract_id="SPY_LATE")
+        await _add_underlying_bar(session, "SPY", late, close=452.0)
+
+    job = GreeksBackfillJob(db_session_factory, _RISK_FREE_RATE, batch_size=10)
+    summary = await asyncio.wait_for(job.run(), timeout=30)
+
+    assert summary["skipped_no_underlying_bar"] == 1
+    assert summary["computed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_row_with_existing_iv_keeps_that_iv(db_session_factory):
+    """`p_iv` is bound unconditionally (executemany needs a consistent
+    parameter set), so this pins that an existing IV is written back
+    unchanged rather than replaced by a re-derived one."""
+
+    async with db_session_factory() as session:
+        bar_time = await _add_option_bar(session, iv=0.30, close=5.0)
+        await _add_underlying_bar(session, "SPY", bar_time, close=452.0)
+
+    job = GreeksBackfillJob(db_session_factory, _RISK_FREE_RATE)
+    await job.run()
+
+    async with db_session_factory() as session:
+        row = await session.get(OptionBar1m, {"time": bar_time, "contract_id": "SPY_C450"})
+        assert float(row.iv) == 0.30
+
+
+@pytest.mark.asyncio
+async def test_backfilled_bars_in_the_past_are_excluded_by_the_prefilter(db_session_factory):
+    """Rows older than the candle-retention window with no underlying bar
+    are dropped in SQL rather than visited and skipped — that's the 1.6M
+    rows that made the old run pointless work. Computable rows from the
+    same old period must still be processed.
+
+    The two rows are on different minutes on purpose: they share a
+    minute, the surviving row's underlying bar would satisfy the EXISTS
+    for both and the dead row would leak past the prefilter.
+    """
+    async with db_session_factory() as session:
+        old_time = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS + 5)
+        dead_time = old_time + timedelta(minutes=1)
+        # The expiration dates are irrelevant to the prefilter (it doesn't
+        # test expiry) but must be in the future relative to each bar's own
+        # timestamp, or _compute_for_row would reject the computable row.
+        await _add_option_bar(
+            session, bar_time=old_time, contract_id="SPY_COMPUTABLE",
+            expiration_date=(old_time.astimezone(_MARKET_TZ) + timedelta(days=10)).date(),
+        )
+        await _add_underlying_bar(session, "SPY", old_time, close=452.0)
+        await _add_option_bar(
+            session, bar_time=dead_time, contract_id="SPY_DEAD",
+            expiration_date=(dead_time.astimezone(_MARKET_TZ) + timedelta(days=10)).date(),
+        )
+        # no underlying bar at dead_time
+
+    job = GreeksBackfillJob(db_session_factory, _RISK_FREE_RATE)
+    summary = await asyncio.wait_for(job.run(), timeout=30)
+
+    assert summary["computed"] == 1
+    assert summary["rows_processed"] == 1  # SPY_DEAD never reached Python
+    assert summary["skipped_no_underlying_bar"] == 0
+

@@ -285,6 +285,26 @@ def is_nan(val: Any) -> bool:
     return False
 
 
+def close_ok(close) -> bool:
+    """Whether a bar's close is usable for a real OHLC row.
+
+    The DXLink `Candle` feed has at times delivered zeroed candles for index
+    underlyings (time populated, OHLC all 0 -- some candles carry
+    `Decimal('0')` values rather than NaN), and a written `0.0` row is
+    *permanent*: under the writers' skip-if-exists rule a later healthy
+    backfill can never repair it. A non-positive or absent close is
+    indistinguishable from "no data," so consuming code refuses bars whose
+    close fails this check instead of writing garbage rows.
+    """
+    if close is None:
+        return False
+    try:
+        f = float(close)
+    except (TypeError, ValueError):
+        return False
+    return f > 0 and not (f != f)  # NaN is the only value unequal to itself
+
+
 def get_attr_any(obj: Any, *names: str, default=None):
     """Try several possible attribute names in order — useful for tolerating
     minor field-naming differences across SDK versions (learned the hard way

@@ -38,6 +38,7 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
+from service.logging_config import clamp_noisy_third_party_loggers
 from service.sources._async_utils import chunked, collect_events, get_attr_any, with_timeout
 from service.sources.base import MarketDataSource
 
@@ -195,6 +196,24 @@ class TastyTradeSource(MarketDataSource):
         async with self._streamer_lock:
             if self._streamer is None:
                 from tastytrade import DXLinkStreamer
+
+                # The `tastytrade` SDK is imported lazily throughout this
+                # module, and its `__init__` unconditionally does
+                # `logging.getLogger("tastytrade").setLevel(DEBUG)`. Since
+                # every submodule logger inherits from that, this silently
+                # re-enables `tastytrade.streamer`'s
+                # `logger.debug("received message: %s", data)` on *every*
+                # websocket frame — a full raw payload dump each time — no
+                # matter what level the app configured, because the SDK's
+                # own setLevel shadows it. This is the exact flood that
+                # `service/logging_config.py` exists to suppress, and it was
+                # still getting through: `configure_logging()` runs at CLI
+                # startup, but these imports happen later and later, so its
+                # clamp had already been undone by the time any message
+                # arrives. Clamping here, immediately after the first real
+                # SDK import, is the one place that can't be bypassed no
+                # matter which entry point or call order got us here.
+                clamp_noisy_third_party_loggers()
 
                 session = self._require_session()
                 self._streamer = await DXLinkStreamer(session).__aenter__()
