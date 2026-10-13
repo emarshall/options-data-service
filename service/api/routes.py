@@ -30,7 +30,11 @@ from service.api.schemas import (
 from service.db.models import Contract, OptionRight, UnderlyingBar1m
 from service.db.session import _engine
 from service.ingestion.gap_detection import RETENTION_DAYS, find_gaps
-from service.db.views import AGG_PERIODS, get_option_bars_table, get_underlying_bars_table
+from service.db.aggregations import (
+    AGG_PERIODS,
+    build_option_bars_query,
+    build_underlying_bars_query,
+)
 
 router = APIRouter(dependencies=[Depends(require_api_key)])
 
@@ -58,29 +62,18 @@ async def get_option_bars(
     if start > end:
         raise HTTPException(status_code=400, detail="start must be <= end")
 
-    table = get_option_bars_table(agg)
-    conditions = [
-        table.c.underlying_ticker == ticker,
-        table.c.time >= start,
-        table.c.time <= end,
-    ]
-    if right is not None:
-        conditions.append(table.c.right == right)
-    if min_delta is not None:
-        conditions.append(table.c.delta >= min_delta)
-    if max_delta is not None:
-        conditions.append(table.c.delta <= max_delta)
-    if expiration is not None:
-        conditions.append(table.c.expiration_date == expiration)
-    if contract_id is not None:
-        conditions.append(table.c.contract_id == contract_id)
-
-    stmt = (
-        select(table)
-        .where(and_(*conditions))
-        .order_by(table.c.time.asc())
-        .limit(limit)
-        .offset(offset)
+    stmt = build_option_bars_query(
+        agg,
+        ticker=ticker,
+        start=start,
+        end=end,
+        right=right,
+        min_delta=min_delta,
+        max_delta=max_delta,
+        expiration=expiration,
+        contract_id=contract_id,
+        limit=limit,
+        offset=offset,
     )
     result = await session.execute(stmt)
     rows = result.mappings().all()
@@ -108,19 +101,8 @@ async def get_underlying_bars(
     if start > end:
         raise HTTPException(status_code=400, detail="start must be <= end")
 
-    table = get_underlying_bars_table(agg)
-    stmt = (
-        select(table)
-        .where(
-            and_(
-                table.c.ticker == ticker,
-                table.c.time >= start,
-                table.c.time <= end,
-            )
-        )
-        .order_by(table.c.time.asc())
-        .limit(limit)
-        .offset(offset)
+    stmt = build_underlying_bars_query(
+        agg, ticker=ticker, start=start, end=end, limit=limit, offset=offset
     )
     result = await session.execute(stmt)
     rows = result.mappings().all()

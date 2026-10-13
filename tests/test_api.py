@@ -10,13 +10,85 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
+from sqlalchemy.util import await_only
 
 from service.api.deps import get_session
 from service.api.main import app
 from service.db.models import Base, Contract, OptionBar1m, OptionRight, UnderlyingBar1m
-from service.db.views import OPTION_BARS_VIEW_TABLES, UNDERLYING_BARS_VIEW_TABLES, _metadata as _views_metadata
+
+
+# --- SQLite shims for TimescaleDB's aggregation functions -----------------
+#
+# The query API aggregates option/underlying bars on the fly with
+# TimescaleDB's time_bucket()/first()/last() (see service/db/aggregations.py).
+# SQLite has none of those, so the test engine gets Python shims registered
+# on every connection — enough to exercise the real route/query end-to-end
+# against seeded 1m rows. Real TimescaleDB aggregation is what production
+# runs; this is purely so the dispatch + aggregation logic is testable here.
+
+_INTERVAL_SECONDS = {
+    "5 minutes": 300,
+    "15 minutes": 900,
+    "30 minutes": 1800,
+    "1 hour": 3600,
+    "1 day": 86400,
+    "1 week": 604800,
+}
+_SQLITE_DT_FMT = "%Y-%m-%d %H:%M:%S.%f"
+
+
+def _parse_sqlite_dt(value):
+    if isinstance(value, datetime):
+        return value
+    return datetime.strptime(str(value), _SQLITE_DT_FMT)
+
+
+def _time_bucket(interval, value):
+    if value is None:
+        return None
+    seconds = _INTERVAL_SECONDS[interval]
+    epoch = datetime(1970, 1, 1)
+    floored = int((_parse_sqlite_dt(value) - epoch).total_seconds()) // seconds * seconds
+    return (epoch + timedelta(seconds=floored)).strftime(_SQLITE_DT_FMT)
+
+
+class _FirstValue:
+    """Aggregate picking the value whose companion timestamp is earliest."""
+
+    def __init__(self):
+        self._time = None
+        self._value = None
+
+    def step(self, value, time):
+        if time is not None and (self._time is None or time < self._time):
+            self._time = time
+            self._value = value
+
+    def finalize(self):
+        return self._value
+
+
+class _LastValue(_FirstValue):
+    """Aggregate picking the value whose companion timestamp is latest."""
+
+    def step(self, value, time):
+        if time is not None and (self._time is None or time > self._time):
+            self._time = time
+            self._value = value
+
+
+def _register_timescaledb_shims(engine):
+    @event.listens_for(engine.sync_engine, "connect")
+    def _on_connect(dbapi_conn, _record):
+        inner = dbapi_conn.driver_connection
+        await_only(inner.create_function("time_bucket", 2, _time_bucket))
+        # aiosqlite exposes create_function but not create_aggregate; register
+        # aggregates through the same worker-thread queue create_function uses.
+        await_only(inner._execute(inner._conn.create_aggregate, "first", 2, _FirstValue))
+        await_only(inner._execute(inner._conn.create_aggregate, "last", 2, _LastValue))
 
 
 @pytest.fixture
@@ -26,17 +98,9 @@ async def db_session_factory():
         poolclass=StaticPool,
         connect_args={"check_same_thread": False},
     )
+    _register_timescaledb_shims(engine)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Also create the (otherwise TimescaleDB-only) continuous aggregate
-        # views' table shapes here, as plain tables — lets us test the
-        # actual route/query-dispatch logic for agg=5m etc. end-to-end,
-        # even though SQLite obviously can't do real continuous
-        # aggregation. Real aggregate *content* is validated separately
-        # against actual Postgres (see PLAN.md Task 7/8 notes) — this is
-        # purely about proving the API selects the right table and filters
-        # correctly, not about TimescaleDB's own materialization behavior.
-        await conn.run_sync(_views_metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     yield factory
     await engine.dispose()
@@ -228,28 +292,33 @@ async def test_get_underlying_bars(client, db_session_factory):
 
 
 @pytest.mark.asyncio
-async def test_get_underlying_bars_agg_5m_queries_the_view_table(client, db_session_factory):
-    """Proves the route actually selects and queries the option_bars_5m-
-    style view table for agg=5m, not just the 1m hypertable — the view
-    table won't exist as ORM-mapped rows, so this inserts directly via
-    Core against the lightweight Table definition from service/db/views.py."""
-    view_table = UNDERLYING_BARS_VIEW_TABLES["5m"]
+async def test_get_underlying_bars_agg_5m_aggregates_raw_rows(client, db_session_factory):
+    """agg=5m aggregates the raw 1m rows on the fly (time_bucket + OHLCV),
+    rather than reading a pre-materialized view."""
     async with db_session_factory() as session:
-        await session.execute(
-            view_table.insert().values(
-                time=_t(0), ticker="SPY", open=440.0, high=442.0, low=439.0, close=441.0, volume=10000,
+        for i in range(5):  # 14:30..14:34, all inside the 14:30 five-minute bucket
+            session.add(
+                UnderlyingBar1m(
+                    time=_t(i), ticker="SPY",
+                    open=440.0 + i, high=441.0 + i, low=439.0 + i, close=440.5 + i,
+                    volume=1000,
+                )
             )
-        )
         await session.commit()
 
     resp = await client.get(
         "/underlying/bars",
-        params={"ticker": "SPY", "start": _t(0).isoformat(), "end": _t(10).isoformat(), "agg": "5m"},
+        params={"ticker": "SPY", "start": _t(0).isoformat(), "end": _t(4).isoformat(), "agg": "5m"},
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["returned"] == 1
-    assert body["bars"][0]["close"] == 441.0
+    bar = body["bars"][0]
+    assert bar["open"] == 440.0   # first
+    assert bar["high"] == 445.0   # max
+    assert bar["low"] == 439.0    # min
+    assert bar["close"] == 444.5  # last
+    assert bar["volume"] == 5000  # sum
 
 
 @pytest.mark.asyncio
@@ -265,33 +334,40 @@ async def test_get_underlying_bars_invalid_agg_returns_400(client):
 
 
 @pytest.mark.asyncio
-async def test_get_option_bars_agg_5m_queries_the_view_table(client, db_session_factory):
-    """Same proof as above, for the option bars endpoint — confirms the
-    5m view table gets queried (with the right/delta filters intact),
-    not just the underlying one."""
-    view_table = OPTION_BARS_VIEW_TABLES["5m"]
+async def test_get_option_bars_agg_5m_aggregates_raw_rows(client, db_session_factory):
+    """Same on-the-fly aggregation as the underlying endpoint, for the
+    option bars endpoint — OHLC is first/max/min/last, Greeks/volume are
+    snapshot/summed, and the right/delta filters still apply."""
+    exp = date(2026, 7, 10)
     async with db_session_factory() as session:
-        await session.execute(
-            view_table.insert().values(
-                time=_t(0), contract_id="SPY_C450", underlying_ticker="SPY",
-                expiration_date=date(2026, 7, 10), strike=450.0, right="call",
-                close=1.5, delta=0.42,
+        for i in range(5):  # all inside the 14:30 five-minute bucket
+            session.add(
+                OptionBar1m(
+                    time=_t(i), contract_id="SPY_C450", underlying_ticker="SPY",
+                    expiration_date=exp, strike=450.0, right=OptionRight.CALL,
+                    open=1.0 + i, high=2.0 + i, low=0.5 + i, close=1.5 + i,
+                    delta=0.40 + i * 0.02, volume=1,
+                )
             )
-        )
         await session.commit()
 
     resp = await client.get(
         "/options/bars",
         params={
-            "ticker": "SPY", "start": _t(0).isoformat(), "end": _t(10).isoformat(),
+            "ticker": "SPY", "start": _t(0).isoformat(), "end": _t(4).isoformat(),
             "agg": "5m", "right": "call",
         },
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["returned"] == 1
-    assert body["bars"][0]["close"] == 1.5
-    assert body["bars"][0]["delta"] == 0.42
+    bar = body["bars"][0]
+    assert bar["open"] == 1.0
+    assert bar["high"] == 6.0
+    assert bar["low"] == 0.5
+    assert bar["close"] == 5.5
+    assert bar["delta"] == pytest.approx(0.48)
+    assert bar["volume"] == 5
 
 
 @pytest.mark.asyncio

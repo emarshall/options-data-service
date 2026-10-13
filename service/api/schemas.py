@@ -1,10 +1,10 @@
 """
 Response schemas for the query API.
 
-Field set on OptionBarOut mirrors option_bars_1m / the continuous
-aggregate views exactly (see service/db/models.py and
-alembic/versions/0002_continuous_aggregates.py) — same columns regardless
-of which aggregation period was queried.
+Field set on OptionBarOut mirrors option_bars_1m exactly (see
+service/db/models.py) — same columns regardless of which aggregation
+period was queried: for agg != "1m" the API aggregates those columns on
+the fly (see service/db/aggregations.py), producing the same field set.
 """
 
 from __future__ import annotations

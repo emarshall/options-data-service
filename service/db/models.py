@@ -7,8 +7,10 @@ See PLAN.md Task 1 for the full rationale. Quick summary:
   row per contract, not per bar).
 - `option_bars_1m` is the base granularity we actually store from the live
   feed / backfill. Every coarser timeframe (5m/15m/30m/1h/1d/1w) is derived
-  from this via TimescaleDB continuous aggregates (Task 7) — we do not store
-  or compute those independently.
+  from this, aggregated on the fly at query time by the API
+  (service/db/aggregations.py) — we do not store those independently. (They
+  were previously TimescaleDB continuous aggregates; migration 0005 dropped
+  them — see service/db/aggregations.py.)
 - `underlying_bars_1m` stores the underlying's own price alongside the
   options. This resolves the "should we also capture underlying bars" open
   question from PLAN.md as yes: it's needed for the Black-Scholes fallback

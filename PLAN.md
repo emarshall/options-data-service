@@ -85,8 +85,9 @@ These were discussed and decided — do not revisit without good reason.
   This informs retention/compression policy defaults (Task 7) and connection/subscription limits
   (Task 3/4) — should be revisited if scale assumptions change materially.
 - **Base granularity stored from the live feed:** 1-minute bars (open/high/low/close of mark price,
-  plus bid/ask, plus a Greeks snapshot). All coarser aggregation periods are derived from this via
-  TimescaleDB continuous aggregates, not stored/computed independently.
+  plus bid/ask, plus a Greeks snapshot). All coarser aggregation periods are derived from this,
+  aggregated on the fly by the query API (`service/db/aggregations.py`) — not stored independently.
+  (Originally served from TimescaleDB continuous aggregates; migration 0005 dropped those — see Task 7.)
 - **Source abstraction:** all ingestion goes through a `MarketDataSource` interface (auth, subscribe
   quotes, subscribe greeks, subscribe/request candles, resolve option chain). TastyTrade/DXLink is the
   first implementation. This interface is what allows a second source to be added later.
@@ -584,6 +585,16 @@ exception handling and crashing the entire backfill job instead of failing grace
 ---
 
 ### Task 7 — TimescaleDB Continuous Aggregates for Higher Timeframes
+> **SUPERSEDED (2026-10-14):** every continuous aggregate this task created has since been **dropped**
+> by `alembic/versions/0005_drop_continuous_aggregates.py`. They occupied ~6.7 GB (~45% of the database)
+> while nothing actually read them — the on-the-fly monitors only ever query 1m bars (and `underlying_bars_1d`),
+> and the backtester only fetches 0DTE 1m bars. The query API now serves `agg=5m/15m/30m/1h/1d/1w` by
+> aggregating `option_bars_1m`/`underlying_bars_1m` on the fly with `time_bucket()` + `first()`/`last()`
+> (see `service/db/aggregations.py`), with identical aggregation semantics (OHLC first/max/min/last,
+> last-value Greeks, summed volume, volume-weighted vwap). The compression policies set up here are
+> **kept** — only the caggs and their refresh policies were removed. The historical notes below are left
+> intact for context on the original design.
+
 **Status:** DONE, partially validated (2026-07-19/20) — one real bug found and fixed against actual
 Postgres (a raw-SQL identifier-quoting issue with the `right` column, see Section 7), but the
 TimescaleDB-specific parts (continuous aggregates, compression policies) remain genuinely untested,
