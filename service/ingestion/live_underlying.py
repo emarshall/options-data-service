@@ -101,7 +101,7 @@ from service.db.models import UnderlyingBar1m
 from service.db.session import check_connection, get_session_factory
 from service.ingestion.backfill import BackfillJob
 from service.logging_config import configure_logging
-from service.sources._async_utils import close_ok, get_attr_any
+from service.sources._async_utils import close_ok, get_attr_any, with_timeout
 from service.sources.tastytrade import TastyTradeSource
 
 # Explicit name, not `__name__`: this module is launched as
@@ -131,6 +131,21 @@ _POLL_IDLE_TIMEOUT_S = 8.0
 # delivered ~450 bars within seconds) while keeping a hung pull short.
 _CATCH_UP_TIMEOUT_S = 120.0
 _CATCH_UP_IDLE_TIMEOUT_S = 60.0
+
+# Trade-drain watchdog. The drain's own deadline (see poll_ticker_trades)
+# only fires when an event *arrives* — a socket the server closed silently
+# yields no events and no exception, so `async for` on `listen()` blocks
+# forever with the poller wedged and zero bars written (observed 2026-10-16:
+# the DXLink server dropped the connection, `subscribe` raised one
+# LocalProtocolError, and every subsequent drain hung undetected for the
+# rest of the session). The drain therefore gets a hard ceiling of
+# `listen_s + _DRAIN_GRACE_S`: a quiet-but-healthy minute is expected
+# (trades are sparse), but a full listen window past the deadline with no
+# events at all means the streamer is presumed dead, and the next poll
+# reconnects from scratch. The grace is deliberately much larger than the
+# poll interval — reconnecting is not free (auth + resubscribe), so it
+# should only happen on real stalls, not on sparse ticks.
+_DRAIN_GRACE_S = 30.0
 
 DEFAULT_TICKERS = ("VIX", "NDX")
 
@@ -429,23 +444,65 @@ async def poll_ticker_trades(
     connected), so ticks arriving between drain periods still accumulate in
     `aggregator`; this call only *listens* for `listen_s`, then flushes the
     minutes that have fully closed (minute start + 60s <= now).
+
+    Failure contract: every streamer interaction is bounded by a timeout,
+    and on any failure the dead streamer is dropped via
+    `source._mark_disconnected()` so the *next* call rebuilds a fresh
+    connection (same reconnect pattern as TastytradeSource._listen_loop).
+    Nothing the aggregator already holds is lost on failure — completed
+    minutes stay queued until the next successful call's flush.
     """
     from tastytrade.dxfeed import Trade
 
     ticker_set = set(tickers)
     streamer = await source._ensure_streamer()
-    await streamer.subscribe(Trade, tickers)
-    deadline = asyncio.get_event_loop().time() + listen_s
     try:
+        await with_timeout(
+            streamer.subscribe(Trade, tickers), timeout_s=10.0, label="trade subscribe",
+        )
+    except Exception as e:
+        # A failed send means the connection is already gone (or going) —
+        # wsproto raises LocalProtocolError when the server has closed the
+        # socket; observed 2026-10-16 at the first poll after an overnight
+        # disconnect. Drop the dead streamer now so the next poll builds a
+        # fresh one instead of reusing the corpse.
+        log.warning("trade subscribe failed (%s) — reconnecting on the next poll.", e)
+        await source._mark_disconnected()
+        raise
+
+    deadline = asyncio.get_event_loop().time() + listen_s
+
+    async def _drain() -> None:
         async for ev in streamer.listen(Trade):
             sym = get_attr_any(ev, "event_symbol", default="")
             if sym in ticker_set:
                 aggregator.feed(sym, ev)
             if asyncio.get_event_loop().time() >= deadline:
                 break
-    finally:
+
+    try:
+        # Hard ceiling — see _DRAIN_GRACE_S. The deadline break inside the
+        # loop only fires when an event *arrives*; a silently-closed socket
+        # delivers neither events nor exceptions, so without this the drain
+        # (and the whole poller) wedges forever. Anything the aggregator
+        # already holds is not lost on failure: completed minutes stay
+        # queued until the next successful poll's flush.
+        await with_timeout(
+            _drain(), timeout_s=listen_s + _DRAIN_GRACE_S, label="trade drain",
+        )
+    except Exception as e:
+        # Timeout or listen failure: the streamer can't be trusted. The next
+        # poll reconnects from scratch (fresh auth + resubscribe).
+        log.warning(
+            "trade drain failed (%s) — reconnecting on the next poll.", e,
+        )
+        await source._mark_disconnected()
+        raise
+    else:
         try:
-            await streamer.unsubscribe(Trade, tickers)
+            await with_timeout(
+                streamer.unsubscribe(Trade, tickers), timeout_s=10.0, label="trade unsubscribe",
+            )
         except Exception as e:
             log.warning("Trade unsubscribe for %s didn't complete cleanly: %s", tickers, e)
 

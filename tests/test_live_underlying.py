@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from service.db.models import Base, UnderlyingBar1m
+from service.ingestion import live_underlying
 from service.ingestion.live_underlying import (
     _run_catch_ups,
     _TradeBarAggregator,
@@ -55,9 +56,17 @@ class FakeStreamer:
 class FakeSource:
     def __init__(self, streamer: FakeStreamer):
         self._streamer = streamer
+        self.disconnected = 0
 
     async def _ensure_streamer(self):
         return self._streamer
+
+    async def _mark_disconnected(self):
+        """Mirrors TastytradeSource._mark_disconnected: drops the cached
+        streamer so the next _ensure_streamer would build a fresh one.
+        Records the call so tests can assert the poller actually resets."""
+        self.disconnected += 1
+        self._streamer = None
 
 
 @pytest.fixture
@@ -231,6 +240,81 @@ async def test_poll_ticker_trades_wont_write_invalid_close(db_session_factory):
             select(UnderlyingBar1m)
         )).scalars().all())
     assert n == 0
+
+
+# ---------------------------------------------------------------------------
+# dead-socket failure paths (2026-10-16 incident regressions)
+# ---------------------------------------------------------------------------
+
+
+class WedgedStreamer(FakeStreamer):
+    """Yields whatever events it was given, then blocks forever — the shape
+    of a socket the server closed silently: no further events, no exception.
+    (Before the drain watchdog this wedged the poller for the rest of the
+    session — zero NDX bars, zero log lines after the first failure.)"""
+
+    async def listen(self, event_type):
+        for ev in self.events:
+            yield ev
+        await asyncio.Event().wait()  # never set
+
+
+async def test_poll_ticker_trades_times_out_wedged_drain_and_resets_streamer(
+    db_session_factory, monkeypatch,
+):
+    monkeypatch.setattr(live_underlying, "_DRAIN_GRACE_S", 0.2)
+    source = FakeSource(WedgedStreamer([]))
+    agg = _TradeBarAggregator()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await poll_ticker_trades(source, db_session_factory, agg, ["NDX"], listen_s=0.1)
+
+    # The dead streamer was dropped, so the next poll's _ensure_streamer
+    # builds a fresh connection instead of reusing the corpse.
+    assert source.disconnected == 1
+    assert source._streamer is None
+
+
+async def test_poll_ticker_trades_wedged_drain_keeps_queued_bars_for_next_flush(
+    db_session_factory, monkeypatch,
+):
+    """A tick received before the wedge must survive it: the aggregator
+    keeps the queued minute, and the next healthy drain flushes it."""
+    monkeypatch.setattr(live_underlying, "_DRAIN_GRACE_S", 0.2)
+    minute = _ms(2026, 10, 13, 13, 30)
+    wedged = FakeSource(WedgedStreamer([FakeTrade("NDX", 30500.0, minute + 1000)]))
+    agg = _TradeBarAggregator()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await poll_ticker_trades(wedged, db_session_factory, agg, ["NDX"], listen_s=0.1)
+
+    # Next iteration of the run() loop: fresh (healthy) streamer, same aggregator.
+    healthy = FakeSource(FakeStreamer([]))
+    await poll_ticker_trades(healthy, db_session_factory, agg, ["NDX"], listen_s=0.05)
+
+    async with db_session_factory() as session:
+        rows = (await session.execute(select(UnderlyingBar1m))).scalars().all()
+    assert len(rows) == 1
+    assert float(rows[0].close) == 30500.0
+
+
+async def test_poll_ticker_trades_resets_streamer_when_subscribe_fails(db_session_factory):
+    """The 2026-10-16 first failure: `subscribe` raising on a socket the
+    server had already closed (wsproto LocalProtocolError). The poller must
+    drop the streamer so the next poll reconnects."""
+
+    class BrokenSubscribeStreamer(FakeStreamer):
+        async def subscribe(self, event_type, symbols):
+            raise ConnectionError("Event TextMessage(...) cannot be sent")
+
+    source = FakeSource(BrokenSubscribeStreamer([]))
+    agg = _TradeBarAggregator()
+
+    with pytest.raises(ConnectionError):
+        await poll_ticker_trades(source, db_session_factory, agg, ["NDX"], listen_s=0.1)
+
+    assert source.disconnected == 1
+    assert source._streamer is None
 
 
 # ---------------------------------------------------------------------------

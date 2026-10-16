@@ -39,6 +39,18 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 log = logging.getLogger(__name__)
 
+# Upper bound on bind parameters per INSERT statement. asyncpg rejects any
+# statement with more than 32,767 arguments, and this helper used to build
+# ONE multi-row INSERT per flush — on 2026-10-16 a single pipeline flush
+# reached ~4,200 option-bar rows x 19 columns ~= 80k parameters and the
+# `ingestion` service crash-looped on InterfaceError for the rest of the
+# session (losing all live SPX option bars that day). SQLite's
+# SQLITE_MAX_VARIABLE_NUMBER is likewise finite (999 on older builds), so
+# batching helps both dialects. The divisor stays a comfortable margin
+# below the asyncpg cap so schema growth (more columns per row) only
+# shrinks the batch, never re-crosses the limit.
+_MAX_BIND_PARAMS = 30_000
+
 
 async def insert_ignore(session, table: Table, rows: Sequence[dict[str, Any]]) -> None:
     """Adds rows to the session, skipping any that violate a uniqueness
@@ -47,16 +59,26 @@ async def insert_ignore(session, table: Table, rows: Sequence[dict[str, Any]]) -
     Async because it executes against an `AsyncSession` — `execute` there
     returns a coroutine, so a sync wrapper would silently insert nothing
     (the coroutine is simply never awaited) rather than fail loudly.
+
+    Large batches are split into multiple statements of at most
+    `_MAX_BIND_PARAMS` bind parameters (see the constant for why the single
+    fat INSERT couldn't stand). All chunks run in the caller's transaction,
+    so a failure partway through still rolls the whole flush back — same
+    all-or-nothing behaviour as the one-statement version had.
     """
     if not rows:
         return
 
     dialect = session.get_bind().dialect.name
-    if dialect == "postgresql":
-        await session.execute(pg_insert(table).on_conflict_do_nothing().values(list(rows)))
-        return
-    if dialect == "sqlite":
-        await session.execute(sqlite_insert(table).on_conflict_do_nothing().values(list(rows)))
+    if dialect in ("postgresql", "sqlite"):
+        insert = pg_insert if dialect == "postgresql" else sqlite_insert
+        # Rows are same-shaped dict mappings (one per table column), so the
+        # first row's key count is the per-row bind-parameter cost.
+        per_row = max(1, len(rows[0]))
+        batch_size = max(1, _MAX_BIND_PARAMS // per_row)
+        for start in range(0, len(rows), batch_size):
+            batch = list(rows[start : start + batch_size])
+            await session.execute(insert(table).on_conflict_do_nothing().values(batch))
         return
 
     log.debug(
