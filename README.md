@@ -133,7 +133,9 @@ curl "http://localhost:8000/underlying/bars?ticker=SPX&start=2026-07-01T00:00:00
 # Which contracts are/were tracked for SPX, expiring in a given window
 curl "http://localhost:8000/contracts?ticker=SPX&start=2026-07-01&end=2026-07-31"
 
-# Quick summary of what data exists: tracked tickers, each one's date range, total row count
+# Quick summary of what data exists: tracked tickers, each one's date range, total row count,
+# and the database's total on-disk size in bytes and GB (Postgres pg_database_size — tables,
+# indexes, TOAST, the lot; cheap, so it's safe to poll)
 curl "http://localhost:8000/metadata"
 
 # Find gaps in SPX's underlying bars over a range (max 120 days per request — see the endpoint's

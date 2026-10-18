@@ -425,6 +425,61 @@ async def test_get_contracts_filters_by_expiration_range(client, db_session_fact
 
 
 @pytest.mark.asyncio
+async def test_get_metadata_summarizes_tickers_and_db_size(client, db_session_factory):
+    async with db_session_factory() as session:
+        await _seed_option_bars(session, contract_id="SPY_C450", ticker="SPY", count=3)
+        await _seed_option_bars(session, contract_id="QQQ_C380", ticker="QQQ", count=2)
+
+    resp = await client.get("/metadata")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert sorted(body["tickers"]) == ["QQQ", "SPY"]
+    assert body["total_db_rows_estimate"] == 5
+    assert body["date_ranges_by_ticker"]["SPY"]["start"].startswith("2026-07-01")
+    # Disk size is a real byte count on every dialect the endpoint supports
+    # (Postgres: pg_database_size; SQLite in tests: page_count * page_size),
+    # reported in both bytes and GB.
+    assert isinstance(body["db_disk_size_bytes"], int)
+    assert body["db_disk_size_bytes"] > 0
+    assert body["db_disk_size_gb"] == round(body["db_disk_size_bytes"] / 1024**3, 3)
+    # Can't be > 0 here: the in-memory SQLite test DB is only tens of KB,
+    # which rounds to 0.0 GB at 3 decimal places (production is many GB).
+    assert body["db_disk_size_gb"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_get_metadata_reports_disk_size_on_postgres():
+    """The SQLite-backed test above only proves the field's shape; the value
+    production actually serves comes from `pg_database_size`, so check the
+    dialect dispatch issues that statement for a postgresql bind too."""
+    from service.api.routes import _db_disk_size_bytes
+
+    calls: list[str] = []
+
+    class _FakeSession:  # duck-typed: the helper only uses get_bind/execute
+        def get_bind(self):
+            class _Dialect:
+                name = "postgresql"
+
+            class _Bind:
+                dialect = _Dialect()
+
+            return _Bind()
+
+        async def execute(self, stmt):
+            calls.append(str(stmt))
+
+            class _Result:
+                def scalar_one(self):
+                    return 12345
+
+            return _Result()
+
+    assert await _db_disk_size_bytes(_FakeSession()) == 12345
+    assert any("pg_database_size" in c for c in calls)
+
+
+@pytest.mark.asyncio
 async def test_health_check_reports_ok_when_db_reachable(client, monkeypatch):
     """/health deliberately checks the real configured DB connection
     directly (service.db.session.check_connection), not through the

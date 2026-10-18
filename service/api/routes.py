@@ -153,11 +153,41 @@ async def get_contracts(
         returned=len(rows),
     )
 
+
+async def _db_disk_size_bytes(session: AsyncSession) -> int | None:
+    """Total on-disk size of the connected database, in bytes (null if the
+    dialect has no way to report it).
+
+    On Postgres this is `pg_database_size(current_database())` — it covers
+    the whole database (tables, indexes, TOAST, Free Space Map etc.), which
+    is the number you care about when deciding whether the volume is about
+    to fill up. It's cheap: the size comes from the file system metadata,
+    not a scan, so it's safe to run on every `/metadata` call.
+
+    The SQLite branch exists only for the test suite (which runs against an
+    in-memory SQLite DB — see `tests/test_api.py`'s `db_session_factory`),
+    approximating the file size as page_count * page_size so the field
+    keeps the same shape; no production path uses it.
+    """
+    dialect = session.get_bind().dialect.name
+    if dialect == "postgresql":
+        return (await session.execute(text(
+            "SELECT pg_database_size(current_database())"
+        ))).scalar_one()
+    if dialect == "sqlite":
+        page_count = (await session.execute(text("PRAGMA page_count"))).scalar_one()
+        page_size = (await session.execute(text("PRAGMA page_size"))).scalar_one()
+        return page_count * page_size
+    return None
+
+
 @router.get("/metadata")
 async def metadata(
     session: AsyncSession = Depends(get_session)
 ):
-    """Returns summary metadata about tickers and data ranges."""
+    """Returns summary metadata about tickers, data ranges, row count, and
+    the database's total on-disk size — in bytes (`db_disk_size_bytes`) and
+    in GB (`db_disk_size_gb`), same figure in both units."""
 
     query_tickers = """
         SELECT DISTINCT underlying_ticker FROM option_bars_1m;
@@ -189,10 +219,19 @@ async def metadata(
     result_row_count = await session.execute(text(query_row_count))
     total_rows = result_row_count.fetchone()[0]
 
+    db_disk_size = await _db_disk_size_bytes(session)
+
     return {
         "tickers": tickers,
         "date_ranges_by_ticker": date_ranges,
-        "total_db_rows_estimate": total_rows
+        "total_db_rows_estimate": total_rows,
+        # GB alongside bytes: the bytes figure is the precise one, but a
+        # human eyeballing `/metadata` output wants "how many GB" without
+        # dividing by 1024**3 in their head. Same number, two units.
+        "db_disk_size_bytes": db_disk_size,
+        "db_disk_size_gb": (
+            round(db_disk_size / 1024**3, 3) if db_disk_size is not None else None
+        ),
     }
 
 
